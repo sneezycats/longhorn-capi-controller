@@ -8,5 +8,5 @@ commonLabels:
   app.kubernetes.io/name: longhorn-capi-controller
   app.kubernetes.io/managed-by: kustomize
 images:
-  - name: ghcr.io/sneezycats/longhorn-capi-controller
-    newTag: latest
+  - name: docker.io/mcclurken/longhorn-capi-controller
+    newTag: 0.3-alpha

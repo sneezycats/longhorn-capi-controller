@@ -36,14 +36,14 @@ spec:
           type: RuntimeDefault
       containers:
         - name: manager
-          image: ghcr.io/sneezycats/longhorn-capi-controller:latest
+          image: docker.io/mcclurken/longhorn-capi-controller:0.3-alpha
           imagePullPolicy: IfNotPresent
           command:
             - /manager
           args:
-            # Must exceed the rebuild time of the largest volume.
-            # For 500 GB volumes on on-prem hardware the KB recommends ≥4h.
-            - --eviction-timeout=4h
+            # Eviction + replica-rebuild timeout. Low for lab tests (small volumes);
+            # raise for larger volumes (the KB recommends ≥4h for 500 GB volumes).
+            - --eviction-timeout=20m
             - --poll-interval=15s
             - --longhorn-namespace=longhorn-system
             - --leader-elect=true
