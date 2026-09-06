@@ -204,32 +204,39 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 		}
 	}
 
-	// 7. Check completion.
-	if !isEvictionComplete(lhNode) {
-		l.Info("Longhorn eviction in progress — requeueing", "machine", machine.Name, "node", nodeName, "elapsed", elapsed.Truncate(time.Second))
-		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
-	}
-
-	// 7b. Rebuild-completion gate: eviction may have drained the node, but the
-	// replicas that lived here must be REBUILT onto surviving nodes before CAPI
-	// proceeds. Releasing the hook just on drain (the KB's classic approach) lets
-	// the replacement node come up with zero replicas and a Degraded/stuck volume.
-	// We wait until every volume has spec.numberOfReplicas running replicas on
-	// NON-deleting nodes; if a replica is (perhaps still) on a node CAPI is deleting
-	// we REMOVE it so Longhorn rebuilds it onto a replica-free node (observed:
-	// a volume can report 3 healthy replicas while one still sits on a doomed node).
+	// 7. Check completion — but ALSO run cleanup regardless of drain state.
+	// We want to delete bad replicas (stopped on gone nodes, or on any node CAPI is
+	// deleting) EVEN IF the evicting node's diskStatus hasn't drained yet. Holding the
+	// hook on eviction alone lets a stale stopped replica block until timeout; running
+	// cleanup independently unblocks the rebuild promptly.
 	delNodes, err := r.deletingNodeNames(ctx)
 	if err != nil {
 		l.Error(err, "Failed to enumerate deleting nodes — requeueing", "machine", machine.Name, "node", nodeName)
 		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
 	}
-	rebuildComplete, removed, affected, err := r.rebuildComplete(ctx, wlClient, nodeName, delNodes)
+	// dev note: also include the evicting node + any not-ready node as a cleanup target.
+	removed, affected, err := r.cleanupBadReplicas(ctx, wlClient, nodeName, delNodes)
 	if err != nil {
-		l.Error(err, "Failed to evaluate replica rebuild state — requeueing", "machine", machine.Name, "node", nodeName)
+		l.Error(err, "Failed to evaluate replica cleanup state — requeueing", "machine", machine.Name, "node", nodeName)
 		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
 	}
 	if len(removed) > 0 {
-		l.Info("Deleted replicas on deleting nodes to force rebuild", "machine", machine.Name, "node", nodeName, "removed", removed)
+		l.Info("Deleted bad replicas (stopped-on-gone or on deleting node) to force rebuild",
+			"machine", machine.Name, "node", nodeName, "removed", removed)
+	}
+
+	// Now check eviction drain state.
+	if !isEvictionComplete(lhNode) {
+		l.Info("Longhorn eviction in progress — requeueing", "machine", machine.Name, "node", nodeName, "elapsed", elapsed.Truncate(time.Second))
+		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+	}
+
+	// Rebuild-completion gate: eviction drained, but the replicas must be REBUILT onto
+	// surviving nodes before CAPI proceeds. Wait until every volume has
+	// spec.numberOfReplicas running replicas on NON-deleting nodes.
+	rebuildComplete, err := r.volumesRebuilt(ctx, wlClient, nodeName, delNodes)
+	if err != nil {
+		l.Error(err, "Failed to evaluate rebuild state — requeueing", "machine", machine.Name, "node", nodeName)
 		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
 	}
 	if !rebuildComplete {
@@ -290,79 +297,118 @@ func (r *LonghornEvictionReconciler) deletingNodeNames(ctx context.Context) (map
 	return out, nil
 }
 
-// rebuildComplete reports whether every volume affected by this eviction has
-// spec.numberOfReplicas running replicas on NON-deleting nodes. It returns
-// (complete, removedReplicaNames, affectedVolumeNames, error).
-//
-// If a running replica still sits on a CAPI-deleting node, we DELETE it so
-// Longhorn rebuilds it onto a node that doesn't already hold one. This closes the
-// observed gap where a volume reports 3 healthy replicas while one still lives on a
-// node scheduled for deletion — the count looks satisfied but the rebuild never
-// moved off the doomed node. We force that by removing the offending replica and
-// only release the hook once the volume is fully healthy on non-deleting nodes.
-func (r *LonghornEvictionReconciler) rebuildComplete(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (complete bool, removed []string, affected []string, err error) {
+// cleanupBadReplicas deletes replicas that are "bad" and thus block a clean rebuild:
+//   (a) any replica (running or stopped) on a node CAPI is deleting (doomed), and
+//   (b) any STOPPED replica whose node is no longer a live, ready Longhorn node
+//       (gone/NotReady) — observed as the stale `stopped` replica that kept a volume
+//       at 3 "healthy" replicas while one never left a doomed node and the rebuild
+//       stalled (longhorn-maintenance-behavior.md E6).
+// Returns (removedNames, affectedVolumes). Runs regardless of eviction drain state so
+// the rebuild is unblocked promptly rather than waiting out the eviction timeout.
+func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (removed []string, affected []string, err error) {
+	// Live, scheduling-eligible Longhorn node hostnames (targets for a rebuild).
+	liveNodes, err := r.liveNodeNames(ctx, wlClient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing live Longhorn nodes: %w", err)
+	}
+
 	replicaList := &longhornv1beta2.ReplicaList{}
 	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
-		return false, nil, nil, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
+		return nil, nil, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
 	}
 
 	affectedVolumes := map[string]bool{}
-	for _, rep := range replicaList.Items {
-		if rep.Spec.Active && rep.Spec.NodeID != "" {
-			if volName := volumeNameFromReplica(&rep); volName != "" {
-				affectedVolumes[volName] = true
-			}
+	for i := range replicaList.Items {
+		rep := &replicaList.Items[i]
+		nodeID := rep.Spec.NodeID
+		volName := volumeNameFromReplica(rep)
+		if volName != "" {
+			affectedVolumes[volName] = true
 		}
+		doomed := nodeID == departingNode || deletingNodes[nodeID]
+		onGoneNode := nodeID != "" && !liveNodes[nodeID] && !rep.Spec.Active
+		if !doomed && !onGoneNode {
+			continue
+		}
+		l := log.FromContext(ctx)
+		l.Info("Deleting bad replica to force a clean rebuild",
+			"replica", rep.Name, "node", nodeID, "volume", volName, "doomed", doomed, "onGoneNode", onGoneNode)
+		if err := wlClient.Delete(ctx, rep); err != nil && !apierrors.IsNotFound(err) {
+			return nil, nil, fmt.Errorf("deleting bad replica %s: %w", rep.Name, err)
+		}
+		removed = append(removed, rep.Name)
 	}
-	if len(affectedVolumes) == 0 {
-		return true, nil, nil, nil
-	}
+
 	names := make([]string, 0, len(affectedVolumes))
 	for n := range affectedVolumes {
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	return removed, names, nil
+}
 
-	// A node is "doomed" if CAPI is deleting it (departingNode is the one this eviction
-	// is for; deletingNodes is the cluster-wide view).
-	doomed := func(node string) bool {
-		return node == departingNode || deletingNodes[node]
+// liveNodeNames returns the set of Longhorn node hostnames that are currently
+// scheduling-eligible (allowScheduling true AND Ready condition true). Used to tell a
+// "gone" node (the doomed/removed worker) from a real, usable rebuild target.
+func (r *LonghornEvictionReconciler) liveNodeNames(ctx context.Context, wlClient client.Client) (map[string]bool, error) {
+	nodeList := &longhornv1beta2.NodeList{}
+	if err := wlClient.List(ctx, nodeList, client.InNamespace(r.LonghornNS)); err != nil {
+		return nil, fmt.Errorf("listing Longhorn nodes in %s: %w", r.LonghornNS, err)
 	}
-
-	// Phase 1: force rebuild — delete any running replica that sits on a doomed node.
-	// Deleting triggers Longhorn to schedule a fresh replica on a node without one.
-	for i := range replicaList.Items {
-		rep := &replicaList.Items[i]
-		if !rep.Spec.Active || !isReplicaRunning(*rep) {
+	out := map[string]bool{}
+	for i := range nodeList.Items {
+		n := &nodeList.Items[i]
+		if !n.Spec.AllowScheduling {
 			continue
 		}
-		if doomed(rep.Spec.NodeID) {
-			volName := volumeNameFromReplica(rep)
-			l := log.FromContext(ctx)
-			l.Info("Replica on deleting node — deleting to force rebuild onto a healthy node",
-				"replica", rep.Name, "node", rep.Spec.NodeID, "volume", volName)
-			if err := wlClient.Delete(ctx, rep); err != nil && !apierrors.IsNotFound(err) {
-				return false, nil, names, fmt.Errorf("deleting replica %s on doomed node %s: %w", rep.Name, rep.Spec.NodeID, err)
-			}
-			removed = append(removed, rep.Name)
+		ready := conditionStatus(n.Status.Conditions, "Ready")
+		if ready == longhornv1beta2.ConditionStatusTrue {
+			out[n.Spec.Name] = true
 		}
 	}
-	if len(removed) > 0 {
-		// We acted this pass; return incomplete so we re-evaluate next poll after
-		// Longhorn has had a chance to schedule the replacement replicas.
-		return false, removed, names, nil
+	return out, nil
+}
+
+// conditionStatus returns the ConditionStatus of the named condition, or Unknown.
+func conditionStatus(conds []longhornv1beta2.Condition, typeName string) longhornv1beta2.ConditionStatus {
+	for _, c := range conds {
+		if c.Type == typeName {
+			return c.Status
+		}
+	}
+	return longhornv1beta2.ConditionStatusUnknown
+}
+
+// volumesRebuilt reports whether every volume affected by this eviction has
+// spec.numberOfReplicas running replicas on NON-deleting nodes (robustness not faulted).
+// This is the final health gate before releasing the pre-terminate hook.
+func (r *LonghornEvictionReconciler) volumesRebuilt(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (complete bool, err error) {
+	replicaList := &longhornv1beta2.ReplicaList{}
+	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
+		return false, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
 	}
 
-	// Phase 2: require full health on non-deleting nodes for every affected volume.
+	affectedVolumes := map[string]bool{}
 	liveByVolume := map[string]int{}
 	for _, rep := range replicaList.Items {
-		if !rep.Spec.Active || doomed(rep.Spec.NodeID) || !isReplicaRunning(rep) {
+		nodeID := rep.Spec.NodeID
+		doomed := nodeID == departingNode || deletingNodes[nodeID]
+		volName := volumeNameFromReplica(&rep)
+		if volName == "" {
 			continue
 		}
-		if volName := volumeNameFromReplica(&rep); volName != "" {
-			liveByVolume[volName]++
+		affectedVolumes[volName] = true
+		if doomed || !isReplicaRunning(rep) {
+			continue
 		}
+		liveByVolume[volName]++
 	}
+
+	names := make([]string, 0, len(affectedVolumes))
+	for n := range affectedVolumes {
+		names = append(names, n)
+	}
+	sort.Strings(names)
 
 	for _, volName := range names {
 		vol := &longhornv1beta2.Volume{}
@@ -370,21 +416,20 @@ func (r *LonghornEvictionReconciler) rebuildComplete(ctx context.Context, wlClie
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return false, nil, names, fmt.Errorf("getting volume %s: %w", volName, err)
+			return false, fmt.Errorf("getting volume %s: %w", volName, err)
 		}
 		want := vol.Spec.NumberOfReplicas
 		if want <= 0 {
 			want = 1
 		}
 		if liveByVolume[volName] < want {
-			return false, nil, names, nil
+			return false, nil
 		}
 		if vol.Status.Robustness == longhornv1beta2.VolumeRobustnessFaulted {
-			return false, nil, names, nil
+			return false, nil
 		}
 	}
-
-	return true, nil, names, nil
+	return true, nil
 }
 
 // volumeNameFromReplica derives the Longhorn volume name from a Replica CR.
