@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -208,6 +210,28 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
 	}
 
+	// 7b. Rebuild-completion gate: eviction may have drained the node, but the
+	// replicas that lived here must be REBUILT onto surviving nodes before CAPI
+	// proceeds. Releasing the hook just on drain (the KB's classic approach) lets
+	// the replacement node come up with zero replicas and a Degraded/stuck volume.
+	// Wait until every volume that lost a replica here reaches spec.numberOfReplicas
+	// with running replicas on surviving nodes (and robustness is not degraded
+	// solely due to the missing replica).
+	rebuildComplete, affected, err := r.rebuildComplete(ctx, wlClient, nodeName)
+	if err != nil {
+		l.Error(err, "Failed to evaluate replica rebuild state — requeueing", "machine", machine.Name, "node", nodeName)
+		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+	}
+	if !rebuildComplete {
+		l.Info("Longhorn eviction drained node but replica rebuild incomplete — holding hook",
+			"machine", machine.Name, "node", nodeName, "affectedVolumes", affected, "elapsed", elapsed.Truncate(time.Second))
+		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+	}
+	if len(affected) > 0 {
+		l.Info("Longhorn replicas rebuilt on surviving nodes — releasing hook",
+			"machine", machine.Name, "node", nodeName, "affectedVolumes", affected, "elapsed", elapsed.Truncate(time.Second))
+	}
+
 	// 8. Complete — release hook.
 	l.Info("Longhorn eviction complete — releasing pre-terminate hook", "machine", machine.Name, "node", nodeName)
 	r.emitEvent(machine, corev1.EventTypeNormal, "LonghornEvictionComplete",
@@ -232,6 +256,110 @@ func isEvictionComplete(node *longhornv1beta2.Node) bool {
 		}
 	}
 	return true
+}
+
+// rebuildComplete reports whether every volume that lost a replica on the departing
+// node has rebuilt to spec.numberOfReplicas running replicas on SURVIVING nodes.
+// It returns (complete, listOfAffectedVolumes, error). If no replicas referenced the
+// departing node, it returns (true, nil, nil) — nothing to rebuild.
+//
+// This closes the gap where eviction drains the node but Longhorn's rebuild of those
+// replicas onto remaining nodes is stalled (see longhorn-maintenance-behavior.md
+// E6/E7): releasing the pre-terminate hook on eviction alone lets CAPI replace the
+// node while the new node comes up with zero/a-degraded replica set.
+func (r *LonghornEvictionReconciler) rebuildComplete(ctx context.Context, wlClient client.Client, departingNode string) (bool, []string, error) {
+	// 1. List replicas to find which volumes had a replica on the departing node.
+	replicaList := &longhornv1beta2.ReplicaList{}
+	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
+		return false, nil, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
+	}
+
+	affectedVolumes := map[string]bool{}
+	for _, rep := range replicaList.Items {
+		if rep.Spec.NodeID == departingNode && rep.Spec.Active {
+			if volName := volumeNameFromReplica(&rep); volName != "" {
+				affectedVolumes[volName] = true
+			}
+		}
+	}
+	if len(affectedVolumes) == 0 {
+		return true, nil, nil
+	}
+
+	// Sort affected volumes for deterministic output.
+	names := make([]string, 0, len(affectedVolumes))
+	for n := range affectedVolumes {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	// 2. Group replicas by volume for the running-on-surviving-node count.
+	liveByVolume := map[string]int{}
+	for _, rep := range replicaList.Items {
+		if !rep.Spec.Active || rep.Spec.NodeID == departingNode {
+			continue
+		}
+		// Only count replicas that are actually running (not stopped/erroring).
+		if !isReplicaRunning(rep) {
+			continue
+		}
+		if volName := volumeNameFromReplica(&rep); volName != "" {
+			liveByVolume[volName]++
+		}
+	}
+
+	// 3. For each affected volume, require live >= spec.numberOfReplicas and not
+	// degraded-due-to-missing-replica.
+	for _, volName := range names {
+		vol := &longhornv1beta2.Volume{}
+		if err := wlClient.Get(ctx, types.NamespacedName{Name: volName, Namespace: r.LonghornNS}, vol); err != nil {
+			// Volume gone (deleted) — nothing to rebuild.
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return false, names, fmt.Errorf("getting volume %s: %w", volName, err)
+		}
+		want := vol.Spec.NumberOfReplicas
+		if want <= 0 {
+			want = 1
+		}
+		if liveByVolume[volName] < want {
+			return false, names, nil
+		}
+		// If robustness is degraded, it may still be mid-rebuild. Only treat as
+		// incomplete if it is faulted (data-loss) — degraded with enough live
+		// replicas is a rebuild-in-progress we allow to latch onto completion
+		// once live==want. To be safe we require not-faulted.
+		if vol.Status.Robustness == longhornv1beta2.VolumeRobustnessFaulted {
+			return false, names, nil
+		}
+	}
+
+	return true, names, nil
+}
+
+// volumeNameFromReplica derives the Longhorn volume name from a Replica CR.
+// Longhorn names replicas "<volume>-r-<hash>" and sets spec.engineName to
+// "<volume>-e-0". We prefer spec.engineName minus the trailing "-e-<n>" segment,
+// falling back to stripping the "-r-<hash>" suffix from the object name.
+func volumeNameFromReplica(rep *longhornv1beta2.Replica) string {
+	if rep.Spec.EngineName != "" {
+		if idx := strings.LastIndex(rep.Spec.EngineName, "-e-"); idx > 0 {
+			return rep.Spec.EngineName[:idx]
+		}
+		return rep.Spec.EngineName
+	}
+	if idx := strings.LastIndex(rep.Name, "-r-"); idx > 0 {
+		return rep.Name[:idx]
+	}
+	return rep.Name
+}
+
+// isReplicaRunning reports whether a replica is usable (currently running and not failed).
+func isReplicaRunning(rep longhornv1beta2.Replica) bool {
+	st := rep.Status.InstanceStatus
+	// currentState values: running, stopped, error, starting, stopping.
+	return st.CurrentState == "running" && rep.Spec.FailedAt == ""
 }
 
 // removeHook removes the pre-terminate hook annotation from the Machine CR via PATCH.

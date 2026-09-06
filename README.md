@@ -17,8 +17,9 @@ CAPI blocks `Machine` deletion at the **pre-terminate hook** until every annotat
 2. Registers `pre-terminate.delete.hook.machine.cluster.x-k8s.io/longhorn-node-eviction=<RFC3339>` via `PATCH` (timestamp survives restarts for timeout).
 3. Patches the Longhorn `Node` CR in the **workload cluster** (`longhorn-system/<nodeName>`) to `{allowScheduling:false, evictionRequested:true}`.
 4. Polls every `--poll-interval` (15 s) until **all** disks report `len(ScheduledReplica)==0 && len(ScheduledBackingImage)==0`.
-5. Removes the hook annotation → CAPI proceeds to `InfrastructureMachine` → `BootstrapConfig` → `Node` deletion.
-6. If eviction stalls past `--eviction-timeout` (default 2 h, **recommend 4 h+** for ≥500 GB volumes), emits a `Warning` Event and releases the hook anyway so CAPI is never blocked forever.
+5. **Rebuild-completion gate (NEW):** draining the node isn't enough — the replicas that lived there must actually **rebuild onto surviving nodes** before CAPI proceeds. The controller lists `Replica`s on the departing node to derive the affected `Volume`s, and waits until each reaches `spec.numberOfReplicas` running replicas on surviving nodes (robustness not `faulted`). This closes the gap (see the maintenance-behavior catalog) where Longhorn evicts a node but leaves the rebuild stalled, so the replacement node would otherwise come up with a degraded/zero-replica volume.
+6. Removes the hook annotation → CAPI proceeds to `InfrastructureMachine` → `BootstrapConfig` → `Node` deletion.
+7. If eviction OR rebuild stalls past `--eviction-timeout` (default 2 h, **recommend 4 h+** for ≥500 GB volumes), emits a `Warning` Event and releases the hook anyway so CAPI is never blocked forever.
 
 Per-disk replica counts are logged at `V(1)` for stall diagnosis. Each `Machine` reconciles independently (max 10 concurrent).
 
