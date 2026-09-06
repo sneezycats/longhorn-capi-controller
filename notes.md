@@ -42,3 +42,21 @@ All deliverables complete — **verified with real tool output** (`go mod tidy` 
   clean state). The rebuild gate ensures health before CAPI proceeds, but does not yet GC the
   stopped replicas on gone nodes. Consider: watch Machine deletion-complete + evictionRequested
   node, then delete stopped replicas whose node's longhorn Node CR is gone.
+
+### 0.3-alpha — deleting-node replica awareness + force-rebuild (addresses the "healthy but on a doomed node" case)
+- Realized the user's finer concern: a volume can report 3 healthy replicas while one still lives on
+  a node CAPI is deleting. The 0.2 gate only required ">= number-of-replicas running on surviving
+  nodes" which does NOT catch a replica that is (still) on a deleting node.
+- New behavior in `rebuildComplete()`:
+  1. Build the cluster-wide set of deleting nodes from management-cluster Machines with
+     deletionTimestamp + non-empty status.nodeRef (`deletingNodeNames`).
+  2. Treat a node as "doomed" if it is the departing node OR in the deleting set.
+  3. If any RUNNING replica sits on a doomed node, DELETE it (longhorn.io replicas `delete` RBAC
+     added). This forces Longhorn to schedule a fresh replica on a node that doesn't already hold one.
+  4. Only release the hook once every affected Volume has spec.numberOfReplicas running replicas on
+     NON-doomed nodes and robustness != faulted.
+- 0.2 vs 0.3: 0.2 checked the count on surviving nodes; 0.3 additionally detects a replica still on
+  a deleting node and proactively deletes it (the manual step from E6). This is the difference that
+  makes the upgrade fully autonomour without manual replica deletion.
+- RBAC: workload role now `delete` on longhorn.io `replicas`. Management machines get/list/watch already present.
+- Verified: `go build ./...`, `go vet ./...` clean.

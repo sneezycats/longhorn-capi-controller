@@ -20,11 +20,11 @@ rules:
   - apiGroups: ["longhorn.io"]
     resources: ["nodes/status"]
     verbs: ["get"]
-  # Rebuild-completion gate: list replicas (to derive affected volumes on the
-  # departing node) and volumes (to verify spec.numberOfReplicas rebuilt).
+  # Rebuild-completion gate: list replicas + volumes to verify rebuild; DELETE a
+  # replica that sits on a CAPI-deleting node to force a rebuild onto a healthy node.
   - apiGroups: ["longhorn.io"]
     resources: ["replicas"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "delete"]
   - apiGroups: ["longhorn.io"]
     resources: ["volumes"]
     verbs: ["get", "list", "watch"]
