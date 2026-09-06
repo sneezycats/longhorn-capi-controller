@@ -1,0 +1,60 @@
+# ClusterRole to apply inside EACH workload cluster where Longhorn is installed.
+# The controller authenticates to workload clusters via the per-cluster kubeconfig
+# Secret (<cluster>-kubeconfig) whose ServiceAccount must be bound to this role.
+#
+# Apply with:
+#   kubectl --kubeconfig <workload-kubeconfig> apply -f workload_role.yaml
+#
+# Or via Fleet/ArgoCD bundle targeting workload clusters.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: longhorn-capi-eviction-workload
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+    app.kubernetes.io/component: workload-rbac
+rules:
+  - apiGroups: ["longhorn.io"]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["longhorn.io"]
+    resources: ["nodes/status"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: longhorn-capi-eviction-workload
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+    app.kubernetes.io/component: workload-rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: longhorn-capi-eviction-workload
+subjects:
+  # Replace `name` / `namespace` with the ServiceAccount identity that appears
+  # inside the workload cluster kubeconfig stored in the management cluster.
+  # For the default CAPI kubeconfig this is typically the `capi-kubeadm-control-plane`
+  # or a dedicated controller ServiceAccount. Adjust to your environment.
+  - kind: ServiceAccount
+    name: longhorn-capi-eviction-controller
+    namespace: longhorn-capi-system
+
+---
+# Namespaced variant — use this instead of the ClusterRole above if your
+# Longhorn installation is restricted to a single namespace.
+# Uncomment and apply if needed.
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: longhorn-capi-eviction-workload
+#   namespace: longhorn-system
+# rules:
+#   - apiGroups: ["longhorn.io"]
+#     resources: ["nodes"]
+#     verbs: ["get", "list", "watch", "patch", "update"]
+#   - apiGroups: ["longhorn.io"]
+#     resources: ["nodes/status"]
+#     verbs: ["get"]

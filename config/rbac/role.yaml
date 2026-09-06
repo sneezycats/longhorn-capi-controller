@@ -1,0 +1,86 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: longhorn-capi-eviction-controller
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+    app.kubernetes.io/component: controller
+rules:
+  # CAPI Machine CRs — core lifecycle.
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["machines"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["machines/status"]
+    verbs: ["get"]
+
+  # Kubeconfig Secrets — one per workload cluster, named <cluster>-kubeconfig.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+
+  # Events emitted on Machine CRs (timeout / completion).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: longhorn-capi-eviction-controller
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: longhorn-capi-eviction-controller
+subjects:
+  - kind: ServiceAccount
+    name: longhorn-capi-eviction-controller
+    namespace: longhorn-capi-system
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: longhorn-capi-eviction-controller
+  namespace: longhorn-capi-system
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+    app.kubernetes.io/component: controller
+
+---
+# Leader election — controller-runtime uses Lease by default.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: longhorn-capi-eviction-leader-election
+  namespace: longhorn-capi-system
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: longhorn-capi-eviction-leader-election
+  namespace: longhorn-capi-system
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: longhorn-capi-eviction-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: longhorn-capi-eviction-controller
+    namespace: longhorn-capi-system
