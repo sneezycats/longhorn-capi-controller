@@ -248,10 +248,25 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 			"machine", machine.Name, "node", nodeName, "removed", removed)
 	}
 
-	// Now check eviction drain state.
+	// Now check eviction drain state. If the node's self-reported diskStatus
+	// still lists scheduled replicas, cross-check against the Replica CRs —
+	// the authoritative store. When a departing node's longhorn-manager dies
+	// mid-eviction its status map freezes with stale entries (E11: replica
+	// already evicted, scheduledReplica still listing it), which would hold
+	// the hook until timeout. If no live replica CR remains on the node,
+	// eviction IS complete regardless of the frozen status.
 	if !isEvictionComplete(lhNode) {
-		l.Info("Longhorn eviction in progress — requeueing", "machine", machine.Name, "node", nodeName, "elapsed", elapsed.Truncate(time.Second))
-		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+		replicasDrained, err := r.nodeReplicasDrained(ctx, wlClient, nodeName, delNodes)
+		if err != nil {
+			l.Error(err, "Failed to cross-check replica drain state — requeueing", "machine", machine.Name, "node", nodeName)
+			return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+		}
+		if !replicasDrained {
+			l.Info("Longhorn eviction in progress — requeueing", "machine", machine.Name, "node", nodeName, "elapsed", elapsed.Truncate(time.Second))
+			return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+		}
+		l.Info("Node diskStatus stale (manager likely dead) but no replica CRs remain on node — treating eviction as complete",
+			"machine", machine.Name, "node", nodeName, "elapsed", elapsed.Truncate(time.Second))
 	}
 
 	// Rebuild-completion gate: eviction drained, but the replicas must be REBUILT onto
@@ -317,6 +332,29 @@ func isEvictionComplete(node *longhornv1beta2.Node) bool {
 		}
 	}
 	return true
+}
+
+// nodeReplicasDrained cross-checks the departing node's frozen diskStatus against
+// the Replica CRs (authoritative). Returns true when the node hosts no RUNNING
+// replica of any live volume — i.e. the eviction's actual work is done even if
+// the dead node's status map still lists stale scheduledReplica entries.
+func (r *LonghornEvictionReconciler) nodeReplicasDrained(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (bool, error) {
+	replicaList := &longhornv1beta2.ReplicaList{}
+	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
+		return false, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
+	}
+	for i := range replicaList.Items {
+		rep := &replicaList.Items[i]
+		if rep.Spec.NodeID != departingNode {
+			continue
+		}
+		// A running replica on the departing node = eviction not drained.
+		// (Replicas of deleted volumes linger as stopped; only RUNNING blocks.)
+		if isReplicaRunning(*rep) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 // deletingNodeNames returns the set of node names that CAPI is currently deleting,
