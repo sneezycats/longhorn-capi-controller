@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
@@ -125,6 +126,12 @@ func (r *LonghornNodeGCReconciler) workloadClient(ctx context.Context, key, clus
 func (r *LonghornNodeGCReconciler) gcOrphanedNodes(ctx context.Context, wlClient client.Client) ([]string, error) {
 	lhNodes := &longhornv1beta2.NodeList{}
 	if err := wlClient.List(ctx, lhNodes, client.InNamespace(r.LonghornNS)); err != nil {
+		// Clusters without Longhorn (e.g. k3s tooling clusters) fail the list
+		// with a REST-mapping "no matches for kind" error. That is not an
+		// error for the GC — skip them quietly.
+		if isNoMatchErr(err) {
+			return nil, nil
+		}
 		return nil, err
 	}
 
@@ -168,4 +175,16 @@ func (r *LonghornNodeGCReconciler) emitGCEvent(obj runtime.Object, message strin
 	if r.Recorder != nil {
 		r.Recorder.Event(obj, corev1.EventTypeNormal, "LonghornNodeGC", message)
 	}
+}
+
+// isNoMatchErr reports whether err is a REST-mapping "no matches for kind"
+// error (i.e. the CRD is absent in the target cluster).
+func isNoMatchErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(*meta.NoKindMatchError); ok {
+		return true
+	}
+	return strings.Contains(err.Error(), "no matches for kind")
 }

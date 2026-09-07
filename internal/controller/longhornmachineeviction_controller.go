@@ -29,6 +29,14 @@ import (
 // HookAnnotation is the CAPI pre-terminate hook annotation key.
 const HookAnnotation = "pre-terminate.delete.hook.machine.cluster.x-k8s.io/longhorn-node-eviction"
 
+// HookReleasedAnnotation records that we released the hook once for this
+// deletion. CAPI's deletion of the Machine may take a while after release
+// (e.g. when infra deletion stalls); without this marker the reconciler would
+// re-register the hook on every subsequent reconcile — re-arming the very
+// gate it just released (observed in E10: "Eviction timeout exceeded" followed
+// by endless re-registration while the machine sat in Deleting).
+const HookReleasedAnnotation = "longhorn-capi.sneezycats.io/hook-released"
+
 // LonghornEvictionReconciler reconciles CAPI Machine objects to ensure
 // Longhorn replicas are fully evicted before the Machine is terminated.
 //
@@ -89,6 +97,15 @@ func (r *LonghornEvictionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 // annotation has not yet been added.
 func (r *LonghornEvictionReconciler) handleDeletionDetected(ctx context.Context, machine *clusterv1.Machine) (ctrl.Result, error) {
 	l := log.FromContext(ctx)
+
+	// State: DELETION_DETECTED — hook not yet registered. But if we already
+	// released the hook once for this deletion, never re-register: CAPI is
+	// free to finish deleting the machine, and re-arming the hook here would
+	// wedge the deletion (observed in E10).
+	if machine.Annotations[HookReleasedAnnotation] != "" {
+		l.Info("Hook already released for this deletion — not re-registering", "machine", machine.Name)
+		return ctrl.Result{}, nil
+	}
 
 	// If NodeRef is nil the node never joined or was already removed — nothing to evict.
 	if machine.Status.NodeRef == nil || machine.Status.NodeRef.Name == "" {
@@ -469,6 +486,12 @@ func (r *LonghornEvictionReconciler) removeHook(ctx context.Context, machine *cl
 	}
 	patch := client.MergeFrom(latest.DeepCopy())
 	delete(latest.Annotations, HookAnnotation)
+	// Mark the release so the reconciler never re-arms the hook for this
+	// deletion (the re-registration loop observed in E10).
+	if latest.Annotations == nil {
+		latest.Annotations = map[string]string{}
+	}
+	latest.Annotations[HookReleasedAnnotation] = time.Now().UTC().Format(time.RFC3339)
 	if err := r.Patch(ctx, latest, patch); err != nil {
 		if apierrors.IsConflict(err) {
 			// Retry once on conflict.
