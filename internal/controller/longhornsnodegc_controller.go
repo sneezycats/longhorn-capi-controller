@@ -177,8 +177,10 @@ func (r *LonghornNodeGCReconciler) emitGCEvent(obj runtime.Object, message strin
 	}
 }
 
-// isNoMatchErr reports whether err is a REST-mapping "no matches for kind"
-// error (i.e. the CRD is absent in the target cluster).
+// isNoMatchErr reports whether err is a REST-mapping "no matches" error (i.e.
+// the CRD is absent in the target cluster). Matches both the classic
+// "no matches for kind X in version Y" phrasing and the discovery variant
+// "no matches for group/version, Resource=" / "no matches for group/version, Resource=...".
 func isNoMatchErr(err error) bool {
 	if err == nil {
 		return false
@@ -186,5 +188,11 @@ func isNoMatchErr(err error) bool {
 	if _, ok := err.(*meta.NoKindMatchError); ok {
 		return true
 	}
-	return strings.Contains(err.Error(), "no matches for kind")
+	if _, ok := err.(*meta.NoResourceMatchError); ok {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no matches for kind") ||
+		strings.Contains(msg, "no matches for longhorn.io") ||
+		strings.Contains(msg, "unable to retrieve the complete list of server APIs: longhorn.io")
 }
