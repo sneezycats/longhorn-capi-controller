@@ -36,6 +36,7 @@ func main() {
 		pollInterval          time.Duration
 		longhornNamespace     string
 		gcInterval            time.Duration
+		earlyRelease          bool
 		metricsAddr           string
 		probeAddr             string
 		enableLeaderElection  bool
@@ -51,6 +52,8 @@ func main() {
 		"Namespace where Longhorn is deployed in workload clusters.")
 	flag.DurationVar(&gcInterval, "gc-interval", envDuration("GC_INTERVAL", 5*time.Minute),
 		"How frequently to sweep for orphaned nodes.longhorn.io CRs whose k8s Node is gone.")
+	flag.BoolVar(&earlyRelease, "early-release", envBool("EARLY_RELEASE", true),
+		"Release the pre-terminate hook early when eviction has drained but the rebuild is blocked only by the departing node's membership (all volumes degraded-but-safe). Skips the eviction-timeout burn.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", envString("METRICS_BIND_ADDRESS", ":8080"),
 		"The address the metrics endpoint binds to. Use :8443 for HTTPS or 0 to disable.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", envString("HEALTH_PROBE_BIND_ADDRESS", ":8081"),
@@ -83,6 +86,7 @@ func main() {
 		EvictionTimeout: evictionTimeout,
 		PollInterval:    pollInterval,
 		LonghornNS:      longhornNamespace,
+		EarlyRelease:    earlyRelease,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Machine")
 		os.Exit(1)

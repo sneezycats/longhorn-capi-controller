@@ -50,6 +50,12 @@ type LonghornEvictionReconciler struct {
 	EvictionTimeout time.Duration
 	PollInterval    time.Duration
 	LonghornNS      string
+	// EarlyRelease: when eviction has drained but the rebuild is blocked only
+	// by the departing node's membership, release the hook early provided all
+	// affected volumes are degraded-but-safe (>= want-1 running replicas, none
+	// faulted). Lets CAPI finish the machine delete so the GC can remove the
+	// stale Longhorn Node CR and the rebuild can proceed on the replacement.
+	EarlyRelease bool
 }
 
 // SetupWithManager registers the controller with the manager.
@@ -251,12 +257,33 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	// Rebuild-completion gate: eviction drained, but the replicas must be REBUILT onto
 	// surviving nodes before CAPI proceeds. Wait until every volume has
 	// spec.numberOfReplicas running replicas on NON-deleting nodes.
-	rebuildComplete, err := r.volumesRebuilt(ctx, wlClient, nodeName, delNodes)
+	rebuildComplete, affected, err := r.volumesRebuilt(ctx, wlClient, nodeName, delNodes)
 	if err != nil {
 		l.Error(err, "Failed to evaluate rebuild state — requeueing", "machine", machine.Name, "node", nodeName)
 		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
 	}
 	if !rebuildComplete {
+		// 0.7 EARLY RELEASE: if the rebuild is blocked only by the departing
+		// node's own membership (disks unavailable), holding the hook just
+		// burns the eviction timeout. Release early when every affected volume
+		// is still degraded-safe (want-1 running replicas, not faulted).
+		if r.EarlyRelease {
+			safe, earlyVolumes, err := r.earlyReleaseSafe(ctx, wlClient, nodeName, delNodes)
+			if err != nil {
+				l.Error(err, "Failed to evaluate early-release safety — requeueing", "machine", machine.Name, "node", nodeName)
+				return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+			}
+			if safe {
+				l.Info("Early release: eviction drained, volumes degraded-but-safe, rebuild blocked only by departing node — releasing hook",
+					"machine", machine.Name, "node", nodeName, "affectedVolumes", earlyVolumes, "elapsed", elapsed.Truncate(time.Second))
+				r.emitEvent(machine, corev1.EventTypeNormal, "LonghornEarlyRelease",
+					fmt.Sprintf("Longhorn eviction drained node %s; volumes degraded-but-safe (rebuild blocked by departing node membership) — releasing pre-terminate hook early", nodeName))
+				if err := r.removeHook(ctx, machine); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, nil
+			}
+		}
 		l.Info("Longhorn eviction drained node but replica rebuild incomplete — holding hook",
 			"machine", machine.Name, "node", nodeName, "affectedVolumes", affected, "elapsed", elapsed.Truncate(time.Second))
 		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
@@ -399,10 +426,40 @@ func conditionStatus(conds []longhornv1beta2.Condition, typeName string) longhor
 // volumesRebuilt reports whether every volume affected by this eviction has
 // spec.numberOfReplicas running replicas on NON-deleting nodes (robustness not faulted).
 // This is the final health gate before releasing the pre-terminate hook.
-func (r *LonghornEvictionReconciler) volumesRebuilt(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (complete bool, err error) {
+func (r *LonghornEvictionReconciler) volumesRebuilt(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (complete bool, affected []string, err error) {
+	names, ok, _, err := r.volumeReplicaState(ctx, wlClient, departingNode, deletingNodes)
+	if err != nil || !ok {
+		return false, names, err
+	}
+	return true, names, nil
+}
+
+// earlyReleaseSafe reports whether the hook can be released BEFORE the replica
+// rebuild finishes without risking data: eviction has drained the departing
+// node, and every volume it held replicas for still has (want-1) running,
+// non-faulted replicas on surviving nodes — degraded, not faulted. In the
+// 3-replica/3-worker/1-disk-per-node topology the rebuild cannot start while
+// the dead node remains a schedulable member ("precheck new replica failed:
+// disks are unavailable"), so holding the hook just burns the eviction timeout
+// (E10). Releasing early lets CAPI delete the machine → the GC removes the
+// stale Longhorn Node CR → Longhorn schedules the rebuild on the replacement.
+// A faulted volume or a replica deficit beyond want-1 still holds the hook.
+func (r *LonghornEvictionReconciler) earlyReleaseSafe(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (bool, []string, error) {
+	names, allComplete, degradedSafe, err := r.volumeReplicaState(ctx, wlClient, departingNode, deletingNodes)
+	if err != nil || allComplete {
+		return false, names, err
+	}
+	return degradedSafe, names, nil
+}
+
+// volumeReplicaState returns the sorted affected-volume names, whether ALL
+// affected volumes already meet their full replica count on live nodes
+// (allComplete), and whether they are all degraded-but-safe (>= want-1 live
+// replicas each and none faulted — degradedSafe). Faulted forces degradedSafe=false.
+func (r *LonghornEvictionReconciler) volumeReplicaState(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (names []string, allComplete bool, degradedSafe bool, err error) {
 	replicaList := &longhornv1beta2.ReplicaList{}
 	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
-		return false, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
+		return nil, false, false, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
 	}
 
 	affectedVolumes := map[string]bool{}
@@ -421,32 +478,37 @@ func (r *LonghornEvictionReconciler) volumesRebuilt(ctx context.Context, wlClien
 		liveByVolume[volName]++
 	}
 
-	names := make([]string, 0, len(affectedVolumes))
+	names = make([]string, 0, len(affectedVolumes))
 	for n := range affectedVolumes {
 		names = append(names, n)
 	}
 	sort.Strings(names)
 
+	allComplete = true
+	degradedSafe = true
 	for _, volName := range names {
 		vol := &longhornv1beta2.Volume{}
 		if err := wlClient.Get(ctx, types.NamespacedName{Name: volName, Namespace: r.LonghornNS}, vol); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
-			return false, fmt.Errorf("getting volume %s: %w", volName, err)
+			return nil, false, false, fmt.Errorf("getting volume %s: %w", volName, err)
 		}
 		want := vol.Spec.NumberOfReplicas
 		if want <= 0 {
 			want = 1
 		}
 		if liveByVolume[volName] < want {
-			return false, nil
+			allComplete = false
+		}
+		if liveByVolume[volName] < want-1 {
+			degradedSafe = false
 		}
 		if vol.Status.Robustness == longhornv1beta2.VolumeRobustnessFaulted {
-			return false, nil
+			return names, false, false, nil
 		}
 	}
-	return true, nil
+	return names, allComplete, degradedSafe, nil
 }
 
 // volumeNameFromReplica derives the Longhorn volume name from a Replica CR.
