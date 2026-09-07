@@ -132,6 +132,19 @@ kubectl -n longhorn-capi-system logs deploy/longhorn-capi-eviction-controller -f
 - **Controller restart** — timestamp in the annotation restores correct timeout accounting.
 - **Concurrent Machines** — each Machine has its own reconcile loop, independent workload clients.
 - **Anti-affinity stalls** — if replica anti-affinity cannot be satisfied on remaining nodes, eviction stalls until timeout. Check `V(1)` logs and Longhorn volume conditions; consider relaxing hard anti-affinity or adding capacity.
+- **Dead-node frozen diskStatus** — a departing node's longhorn-manager can die mid-eviction, freezing `diskStatus.scheduledReplica` with stale entries. The controller cross-checks the **Replica CRs** (authoritative): if no RUNNING replica remains on the node, eviction is treated as complete regardless of the frozen status.
+- **RWO pod holds the volume attached** — after hook release, CAPI can still stall at its native `WaitingForVolumeDetach` stage because attachments follow *pods*, not replicas. With `--evict-stuck-pods` (default on) the controller cordons the departing node and force-deletes non-DaemonSet pods holding non-faulted Longhorn PVCs so the volume detaches and the Machine delete completes.
+
+### Feature flags
+
+| Flag | Env | Default | Behavior |
+|---|---|---|---|
+| `--eviction-timeout` | `EVICTION_TIMEOUT` | 2h | Backstop: release the hook after this long even if eviction/rebuild is incomplete. **Recommend 4h+ for ≥500 GB volumes.** With early release active this is rarely hit. |
+| `--poll-interval` | `POLL_INTERVAL` | 15s | Reconcile cadence while a hook is held. |
+| `--longhorn-namespace` | `LONGHORN_NAMESPACE` | `longhorn-system` | Namespace of Longhorn in workload clusters. |
+| `--gc-interval` | `GC_INTERVAL` | 5m | Sweep cadence for orphaned `nodes.longhorn.io` CRs whose k8s Node is gone (stuck-finalizer workaround for longhorn/longhorn#6487). k8s Node list is the source of truth — a node whose k8s Node exists is never touched. |
+| `--early-release` | `EARLY_RELEASE` | `true` | Release the hook early when eviction drained but the rebuild is blocked only by the departing node's membership, **iff** every affected volume still has ≥ want−1 running replicas and none is faulted (degraded-but-safe). |
+| `--evict-stuck-pods` | `EVICT_STUCK_PODS` | `true` | After hook release: cordon the departing node and force-delete non-DaemonSet pods holding non-faulted Longhorn PVCs to release attachments. |
 
 ---
 
