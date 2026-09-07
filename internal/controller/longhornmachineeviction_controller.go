@@ -154,7 +154,7 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	}
 
 	// 3. Build workload cluster client.
-	wlClient, err := r.buildWorkloadClusterClient(ctx, clusterName, machine.Namespace)
+	wlClient, err := buildWorkloadClusterClient(ctx, r.Client, clusterName, machine.Namespace)
 	if err != nil {
 		l.Error(err, "Failed to build workload cluster client — requeueing", "machine", machine.Name, "cluster", clusterName)
 		// Do NOT release hook — wait for connectivity, up to timeout.
@@ -503,10 +503,10 @@ var workloadScheme = func() *runtime.Scheme {
 
 // buildWorkloadClusterClient constructs a controller-runtime client for the workload cluster
 // identified by clusterName/namespace by reading the <clusterName>-kubeconfig Secret.
-func (r *LonghornEvictionReconciler) buildWorkloadClusterClient(ctx context.Context, clusterName, namespace string) (client.Client, error) {
+func buildWorkloadClusterClient(ctx context.Context, mgmtClient client.Client, clusterName, namespace string) (client.Client, error) {
 	secretName := clusterName + "-kubeconfig"
 	secret := &corev1.Secret{}
-	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
+	if err := mgmtClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
 		return nil, fmt.Errorf("fetching kubeconfig secret %s/%s: %w", namespace, secretName, err)
 	}
 	kubeconfigBytes, ok := secret.Data["value"]

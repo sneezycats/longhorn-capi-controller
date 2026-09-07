@@ -16,7 +16,10 @@ metadata:
 rules:
   - apiGroups: ["longhorn.io"]
     resources: ["nodes"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "list", "watch", "patch", "update", "delete"]
+  - apiGroups: ["longhorn.io"]
+    resources: ["nodes/finalizers"]
+    verbs: ["update"]
   - apiGroups: ["longhorn.io"]
     resources: ["nodes/status"]
     verbs: ["get"]

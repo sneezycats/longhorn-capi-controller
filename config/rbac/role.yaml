@@ -14,6 +14,11 @@ rules:
     resources: ["machines/status"]
     verbs: ["get"]
 
+  # Node GC: enumerate CAPI Clusters to find workload clusters to sweep.
+  - apiGroups: ["cluster.x-k8s.io"]
+    resources: ["clusters"]
+    verbs: ["get", "list", "watch"]
+
   # Kubeconfig Secrets — one per workload cluster, named <cluster>-kubeconfig.
   - apiGroups: [""]
     resources: ["secrets"]

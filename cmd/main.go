@@ -35,6 +35,7 @@ func main() {
 		evictionTimeout       time.Duration
 		pollInterval          time.Duration
 		longhornNamespace     string
+		gcInterval            time.Duration
 		metricsAddr           string
 		probeAddr             string
 		enableLeaderElection  bool
@@ -48,6 +49,8 @@ func main() {
 		"How frequently to re-check Longhorn node status during eviction.")
 	flag.StringVar(&longhornNamespace, "longhorn-namespace", envString("LONGHORN_NAMESPACE", "longhorn-system"),
 		"Namespace where Longhorn is deployed in workload clusters.")
+	flag.DurationVar(&gcInterval, "gc-interval", envDuration("GC_INTERVAL", 5*time.Minute),
+		"How frequently to sweep for orphaned nodes.longhorn.io CRs whose k8s Node is gone.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", envString("METRICS_BIND_ADDRESS", ":8080"),
 		"The address the metrics endpoint binds to. Use :8443 for HTTPS or 0 to disable.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", envString("HEALTH_PROBE_BIND_ADDRESS", ":8081"),
@@ -82,6 +85,17 @@ func main() {
 		LonghornNS:      longhornNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Machine")
+		os.Exit(1)
+	}
+
+	if err := (&controller.LonghornNodeGCReconciler{
+		Client:     mgr.GetClient(),
+		Scheme:     mgr.GetScheme(),
+		Recorder:   mgr.GetEventRecorderFor("longhorn-capi-eviction-controller"),
+		GCInterval: gcInterval,
+		LonghornNS: longhornNamespace,
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Unable to create controller", "controller", "LonghornNodeGC")
 		os.Exit(1)
 	}
 
