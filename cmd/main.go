@@ -37,6 +37,7 @@ func main() {
 		longhornNamespace     string
 		gcInterval            time.Duration
 		earlyRelease          bool
+		evictStuckPods        bool
 		metricsAddr           string
 		probeAddr             string
 		enableLeaderElection  bool
@@ -54,6 +55,8 @@ func main() {
 		"How frequently to sweep for orphaned nodes.longhorn.io CRs whose k8s Node is gone.")
 	flag.BoolVar(&earlyRelease, "early-release", envBool("EARLY_RELEASE", true),
 		"Release the pre-terminate hook early when eviction has drained but the rebuild is blocked only by the departing node's membership (all volumes degraded-but-safe). Skips the eviction-timeout burn.")
+	flag.BoolVar(&evictStuckPods, "evict-stuck-pods", envBool("EVICT_STUCK_PODS", true),
+		"After hook release, cordon the departing node and force-delete non-DaemonSet pods holding non-faulted Longhorn PVCs so the volume detaches and CAPI's WaitingForVolumeDetach completes.")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", envString("METRICS_BIND_ADDRESS", ":8080"),
 		"The address the metrics endpoint binds to. Use :8443 for HTTPS or 0 to disable.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", envString("HEALTH_PROBE_BIND_ADDRESS", ":8081"),
@@ -87,6 +90,7 @@ func main() {
 		PollInterval:    pollInterval,
 		LonghornNS:      longhornNamespace,
 		EarlyRelease:    earlyRelease,
+		EvictStuckPods:  evictStuckPods,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Machine")
 		os.Exit(1)
