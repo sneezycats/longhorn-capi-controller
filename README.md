@@ -143,7 +143,11 @@ kubectl -n longhorn-capi-system logs deploy/longhorn-capi-eviction-controller -f
 
 ## Configuration
 
-All flags have environment-variable equivalents (same name, upper-snake):
+All flags have environment-variable equivalents (same name, upper-snake). They are set on the
+**controller Deployment** in the management cluster — either in `config/manager/manager.yaml`
+(`args:` or `env:`) or with `kubectl -n longhorn-capi-system edit deploy longhorn-capi-eviction-controller`.
+They apply **globally**: one controller watches every workload cluster, so a flag value is not
+per-cluster.
 
 | Flag | Env | Default | Description |
 |---|---|---|---|
