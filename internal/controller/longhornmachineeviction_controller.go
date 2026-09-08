@@ -401,11 +401,13 @@ func (r *LonghornEvictionReconciler) deletingNodeNames(ctx context.Context) (map
 }
 
 // cleanupBadReplicas deletes replicas that are "bad" and thus block a clean rebuild:
-//   (a) any replica (running or stopped) on a node CAPI is deleting (doomed), and
-//   (b) any STOPPED replica whose node is no longer a live, ready Longhorn node
-//       (gone/NotReady) — observed as the stale `stopped` replica that kept a volume
-//       at 3 "healthy" replicas while one never left a doomed node and the rebuild
-//       stalled (longhorn-maintenance-behavior.md E6).
+//
+//	(a) any replica (running or stopped) on a node CAPI is deleting (doomed), and
+//	(b) any STOPPED replica whose node is no longer a live, ready Longhorn node
+//	    (gone/NotReady) — observed as the stale `stopped` replica that kept a volume
+//	    at 3 "healthy" replicas while one never left a doomed node and the rebuild
+//	    stalled (longhorn-maintenance-behavior.md E6).
+//
 // Returns (removedNames, affectedVolumes). Runs regardless of eviction drain state so
 // the rebuild is unblocked promptly rather than waiting out the eviction timeout.
 func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (removed []string, affected []string, err error) {

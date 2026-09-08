@@ -1,0 +1,6 @@
+# Local development artifacts
+prompt.md
+notes.md
+*.tfstate
+*.tfstate.backup
+.terraform/

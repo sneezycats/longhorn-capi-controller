@@ -9,4 +9,4 @@ commonLabels:
   app.kubernetes.io/managed-by: kustomize
 images:
   - name: docker.io/mcclurken/longhorn-capi-controller
-    newTag: 0.3-alpha
+    newTag: 0.9-alpha

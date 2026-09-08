@@ -31,6 +31,19 @@ rules:
   - apiGroups: ["longhorn.io"]
     resources: ["volumes"]
     verbs: ["get", "list", "watch"]
+  # EvictStuckPods (post-release attachment cleanup): cordon the departing node
+  # and force-delete workload pods holding Longhorn PVCs. Requires Pod list/
+  # delete (cluster-wide: pods land in every namespace), PVC lookup (to map a
+  # pod's claim to its Longhorn volume), and core Node patch (cordon).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch", "patch", "update"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1

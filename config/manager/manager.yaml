@@ -41,9 +41,10 @@ spec:
           command:
             - /manager
           args:
-            # Eviction + replica-rebuild timeout. Low for lab tests (small volumes);
-            # raise for larger volumes (the KB recommends ≥4h for 500 GB volumes).
-            - --eviction-timeout=20m
+            # Eviction timeout: MUST exceed the longest single-volume rebuild
+            # time (Longhorn KB recommends ≥4h for ~500 GB volumes on on-prem
+            # hardware). With --early-release active this backstop is rarely hit.
+            - --eviction-timeout=2h
             - --poll-interval=15s
             - --longhorn-namespace=longhorn-system
             - --leader-elect=true

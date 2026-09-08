@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sync"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 
@@ -45,11 +46,15 @@ const LonghornFinalizer = "longhorn.io"
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
 type LonghornNodeGCReconciler struct {
 	client.Client
-	Scheme       *runtime.Scheme
-	Recorder     record.EventRecorder
-	GCInterval   time.Duration
-	LonghornNS   string
-	workloadClients map[string]client.Client // "namespace/clusterName" -> client
+	Scheme     *runtime.Scheme
+	Recorder   record.EventRecorder
+	GCInterval time.Duration
+	LonghornNS string
+	// workloadClients caches per-workload-cluster clients, keyed
+	// "namespace/clusterName". Guarded by mu: accessed from both the Cluster
+	// reconcile path and the periodic ticker goroutine.
+	mu              sync.Mutex
+	workloadClients map[string]client.Client
 }
 
 // SetupWithManager registers the GC as a Machine-watching controller plus a
@@ -111,6 +116,8 @@ func (r *LonghornNodeGCReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 
 // workloadClient returns a cached workload-cluster client for the key.
 func (r *LonghornNodeGCReconciler) workloadClient(ctx context.Context, key, clusterName, namespace string) (client.Client, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if c, ok := r.workloadClients[key]; ok {
 		return c, nil
 	}

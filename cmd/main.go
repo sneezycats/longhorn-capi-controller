@@ -32,15 +32,15 @@ func init() {
 
 func main() {
 	var (
-		evictionTimeout       time.Duration
-		pollInterval          time.Duration
-		longhornNamespace     string
-		gcInterval            time.Duration
-		earlyRelease          bool
-		evictStuckPods        bool
-		metricsAddr           string
-		probeAddr             string
-		enableLeaderElection  bool
+		evictionTimeout      time.Duration
+		pollInterval         time.Duration
+		longhornNamespace    string
+		gcInterval           time.Duration
+		earlyRelease         bool
+		evictStuckPods       bool
+		metricsAddr          string
+		probeAddr            string
+		enableLeaderElection bool
 	)
 
 	// Resolve env overrides with sane precedence: explicit CLI flag wins,

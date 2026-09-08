@@ -1,27 +1,93 @@
 # longhorn-capi-controller
 
-Kubernetes controller that automates **safe Longhorn node eviction** before Cluster API (CAPI) deletes a `Machine` CR during rolling node replacement. Runs in the **CAPI management cluster** (Rancher / Harvester).
+A Kubernetes controller that automates **safe Longhorn data handling during Cluster API (CAPI) node
+replacement**. It runs in the **CAPI management cluster** (Rancher, Harvester, Cluster API
+standalone) and guards the window where a `Machine` is deleted but its Longhorn replicas have not
+yet been safely rebuilt elsewhere.
 
-Prevents catastrophic data loss when CAPI replaces worker nodes that host Longhorn replicas under `/var/lib/longhorn`.
+**Why it exists:** when CAPI replaces a worker node (OS image roll, instance type change, fleet
+update, manual delete), the Longhorn replicas on that node's disks are destroyed with the VM. If the
+replacement logic does not wait for those replicas to be rebuilt on surviving nodes, volumes go
+degraded — and if too many nodes are replaced concurrently, data is lost. The official
+[Longhorn KB: How to evict node during CAPI node rolling replacement](https://longhorn.io/kb/how-to-evict-node-during-capi-node-rolling-replacement/)
+documents the manual procedure. The Longhorn maintainers declined to ship a controller for it
+([longhorn/longhorn#12871](https://github.com/longhorn/longhorn/issues/12871): *"we don't implement
+such operator, KB is the guide"*) — this repository is that implementation.
 
-> Based on the [Longhorn KB: How to evict node during CAPI node rolling replacement](https://longhorn.io/kb/how-to-evict-node-during-capi-node-rolling-replacement/) and [CAPI Machine deletions](https://cluster-api.sigs.k8s.io/tasks/automated-machine-management/machine_deletions).  
-> Longhorn maintainers closed [#12871](https://github.com/longhorn/longhorn/issues/12871) — *"we don't implement such operator, KB is the guide."* This repo is that implementation.
+> **Status:** running in production-shaped lab environments (Harvester + Rancher + RKE2) through
+> ~40 validated node replacements across OS upgrades (SL Micro 6.0→6.1→6.2), 1/3/5/6-worker
+> clusters, single-disk and dedicated-data-disk layouts, concurrent deletions, and controller
+> restarts — with zero data loss and zero manual intervention. See
+> [Validation](#validation) for the test matrix.
 
 ---
 
 ## How it works
 
-CAPI blocks `Machine` deletion at the **pre-terminate hook** until every annotation with prefix `pre-terminate.delete.hook.machine.cluster.x-k8s.io/` is removed. This controller:
+CAPI supports lifecycle hooks on `Machine` deletion. This controller uses the **pre-terminate
+hook**: CAPI pauses the deletion after pod drain and waits until every
+`pre-terminate.delete.hook.machine.cluster.x-k8s.io/*` annotation is removed from the Machine. The
+controller drives the entire safe-eviction sequence between "drain done" and "delete the VM":
 
-1. Watches `Machine` CRs for `deletionTimestamp != nil`.
-2. Registers `pre-terminate.delete.hook.machine.cluster.x-k8s.io/longhorn-node-eviction=<RFC3339>` via `PATCH` (timestamp survives restarts for timeout).
-3. Patches the Longhorn `Node` CR in the **workload cluster** (`longhorn-system/<nodeName>`) to `{allowScheduling:false, evictionRequested:true}`.
-4. Polls every `--poll-interval` (15 s) until **all** disks report `len(ScheduledReplica)==0 && len(ScheduledBackingImage)==0`.
-5. **Rebuild-completion gate + deleting-node cleanup (NEW):** draining the node isn't enough — the replicas that lived there must be **fully rebuilt onto non-deleting nodes** before CAPI proceeds. The controller derives the set of CAPI-deleting nodes (Machines with `deletionTimestamp` + `nodeRef`). If any running replica still sits on a deleting node, the controller **deletes that replica** to force Longhorn to schedule a fresh one on a node that doesn't already hold one; it then waits until every affected `Volume` reaches `spec.numberOfReplicas` running replicas on non-deleting nodes (robustness not `faulted`). This closes the observed gap where a volume reports 3 "healthy" replicas while one still lives on a node scheduled for deletion — the count looks satisfied but the rebuild never leaves the doomed node. Releasing the hook would otherwise let CAPI finish while the replacement node comes up with a degraded/zero-replica set.
-6. Removes the hook annotation → CAPI proceeds to `InfrastructureMachine` → `BootstrapConfig` → `Node` deletion.
-7. If eviction OR rebuild stalls past `--eviction-timeout` (default 2 h, **recommend 4 h+** for ≥500 GB volumes), emits a `Warning` Event and releases the hook anyway so CAPI is never blocked forever.
+```
+Machine deletion detected
+  └─► register pre-terminate hook (timestamped, survives controller restarts)
+       └─► trigger Longhorn eviction on the departing node
+            (allowScheduling=false, evictionRequested=true)
+            └─► wait for eviction drain
+                 ├─ diskStatus empty on the node, OR
+                 └─ authoritative cross-check: no RUNNING replica CRs remain on
+                    the node (covers the dead-manager frozen-status case)
+                      └─► replica-rebuild gate
+                           ├─ all affected volumes have their full replica
+                           │  count on non-deleting nodes → release, or
+                           └─ EARLY RELEASE: every affected volume still has
+                              ≥ want−1 replicas on surviving nodes and none is
+                              faulted → release now (degraded-but-safe; the
+                              rebuild cannot proceed until the departing node
+                              leaves the cluster in 1-disk-per-node topologies)
+                                └─► remove hook → CAPI deletes the VM
+                                     └─► EvictStuckPods: if CAPI then stalls at
+                                          its volume-detach stage (a workload pod
+                                          still holds the RWO attachment), cordon
+                                          the node and delete those pods
+                                     └─► Node GC: sweep orphaned
+                                          nodes.longhorn.io CRs whose k8s Node
+                                          is gone (stuck-finalizer workaround)
+```
 
-Per-disk replica counts are logged at `V(1)` for stall diagnosis. Each `Machine` reconciles independently (max 10 concurrent).
+A backstop timeout (`--eviction-timeout`, default **2h**) releases the hook no matter what, so CAPI
+is never blocked forever. All controller state lives on the Machine annotations — the controller is
+stateless and safe to restart at any point.
+
+### Additional hardening built in
+
+- **Frozen-status cross-check:** a departing node's longhorn-manager can die mid-eviction, leaving
+  its `diskStatus.scheduledReplica` map stale forever. The controller treats the Replica CRs as the
+  authoritative source and will not wait on a dead node's self-reported status.
+- **Bad-replica cleanup:** a running replica on *any* CAPI-deleting node (including a different
+  node than the one being evicted) is deleted to force a clean rebuild — closes the
+  "volume looks healthy but a replica lives on a doomed node" trap.
+- **Node-CR garbage collection:** Longhorn fails to remove `nodes.longhorn.io` CRs for nodes that
+  died before deletion ([longhorn/longhorn#6487](https://github.com/longhorn/longhorn/issues/6487),
+  wontfix). The GC removes them, using the k8s Node list as the source of truth: a Longhorn node
+  whose k8s Node still exists is **never** touched.
+
+---
+
+## Compatibility
+
+| Component | Tested with |
+|---|---|
+| CAPI | v1.10.x (`cluster.x-k8s.io/v1beta1` Machines) |
+| Longhorn | v1.11.x (v1 data engine) in workload clusters |
+| Management cluster | Rancher 2.15 provisioned RKE2 + Harvester node driver |
+| Workload clusters | RKE2 on Harvester VMs (SL Micro), single CP + 1–6 workers |
+| Go | 1.22+ to build |
+
+Should work with any CAPI provider that produces standard `Machine` CRs with `status.nodeRef` and
+per-cluster kubeconfig Secrets (kubeadm, RKE2, Talos providers, etc.). Non-Rancher setups are
+untested — reports welcome.
 
 ---
 
@@ -29,39 +95,47 @@ Per-disk replica counts are logged at `V(1)` for stall diagnosis. Each `Machine`
 
 ### Prerequisites
 
-- Management cluster with CAPI `Machine` CRDs installed.
-- `kubectl` with a kubeconfig for the management cluster.
-- Workload cluster kubeconfigs stored as Secrets `<cluster>-kubeconfig` in the same namespace as the `Machine`/`Cluster` CRs (standard CAPI convention, `data.value` holds raw kubeconfig).
+1. A CAPI management cluster with `Machine`/`Cluster` CRDs.
+2. Longhorn installed in each workload cluster whose nodes you want protected.
+3. Workload cluster kubeconfigs stored as Secrets named `<cluster-name>-kubeconfig`, in the same
+   namespace as the Machines, with the raw kubeconfig under the `value` key (the standard CAPI
+   convention — CAPI creates these automatically).
 
 ### 1. Deploy to the management cluster
 
 ```bash
-# From repo root — creates namespace, RBAC, and Deployment:
 kubectl apply --server-side -k config/manager
+```
 
-# Or build + push your own image first:
-docker build -t ghcr.io/<org>/longhorn-capi-controller:$(git rev-parse --short HEAD) .
-docker push ghcr.io/<org>/longhorn-capi-controller:$(git rev-parse --short HEAD)
-# then override the image in the kustomization:
-kustomize edit -n config/manager set image ghcr.io/sneezycats/longhorn-capi-controller=ghcr.io/<org>/longhorn-capi-controller:$(git rev-parse --short HEAD)
-kubectl apply --server-side -k config/manager
+Or build and push your own image first:
+
+```bash
+docker build -t ghcr.io/<you>/longhorn-capi-controller:$(git rev-parse --short HEAD) .
+docker push ghcr.io/<you>/longhorn-capi-controller:$(git rev-parse --short HEAD)
+# then update the image in config/manager/kustomization.yaml (or use
+# `kustomize edit set image`) and re-apply.
 ```
 
 ### 2. Grant workload-cluster RBAC
 
-The kubeconfig stored in `<cluster>-kubeconfig` authenticates as a ServiceAccount in the **workload** cluster. That identity needs permission to read/patch `nodes.longhorn.io` in `longhorn-system`.
+The controller talks to each workload cluster using the kubeconfig Secret. If that credential is a
+**cluster-admin** (as CAPI's default machine-provisioner kubeconfigs are), skip this step.
+
+For **least-privilege** deployments, apply the workload role to each workload cluster and bind it to
+whatever identity the kubeconfig uses:
 
 ```bash
-# Apply to EACH workload cluster that runs Longhorn:
 kubectl --kubeconfig <workload-kubeconfig> apply -f config/rbac/workload_role.yaml
-# Edit the ClusterRoleBinding subject if the kubeconfig identity differs from
-# longhorn-capi-system/longhorn-capi-eviction-controller.
+# Edit the ClusterRoleBinding subject in that file to match the kubeconfig identity.
 ```
 
-### 3. Verify the controller is running
+The role grants: read/patch/delete on `nodes.longhorn.io`, read on `replicas`/`volumes`
+(longhorn.io), plus Pod list/delete, PVC read, and Node cordon for the EvictStuckPods feature.
+
+### 3. Verify
 
 ```bash
-kubectl -n longhorn-capi-system get pods -l control-plane=longhorn-capi-eviction-controller
+kubectl -n longhorn-capi-system get pods
 kubectl -n longhorn-capi-system logs deploy/longhorn-capi-eviction-controller -f
 ```
 
@@ -69,90 +143,104 @@ kubectl -n longhorn-capi-system logs deploy/longhorn-capi-eviction-controller -f
 
 ## Configuration
 
-| Flag / Env | Default | Description |
-|---|---|---|
-| `--eviction-timeout` / `EVICTION_TIMEOUT` | `2h` | Max time to wait for eviction before releasing the hook. **Set ≥4h for 500 GB volumes on on-prem hardware.** Must exceed the largest single-volume rebuild time. |
-| `--poll-interval` / `POLL_INTERVAL` | `15s` | Interval between Longhorn Node status checks. |
-| `--longhorn-namespace` / `LONGHORN_NAMESPACE` | `longhorn-system` | Namespace where Longhorn is deployed in workload clusters. |
-| `--metrics-bind-address` / `METRICS_BIND_ADDRESS` | `:8080` | Metrics endpoint. `0` to disable. |
-| `--health-probe-bind-address` / `HEALTH_PROBE_BIND_ADDRESS` | `:8081` | `/healthz` and `/readyz`. |
-| `--leader-elect` / `LEADER_ELECT` | `true` | Leader election (`leases`, id `longhorn-capi-eviction-controller`). |
+All flags have environment-variable equivalents (same name, upper-snake):
 
-Edit `config/manager/manager.yaml` `args:` or set env vars on the Deployment.
-
----
-
-## Verification
-
-Trigger a rolling replacement (e.g. Fleet updates a `MachineDeployment` image) and observe:
-
-### Machine annotation
-
-```bash
-# While eviction is in progress this annotation is present with an RFC3339 timestamp:
-kubectl get machine <machine-name> -n <ns> -o jsonpath='{.metadata.annotations}' | jq .
-# expect: {"pre-terminate.delete.hook.machine.cluster.x-k8s.io/longhorn-node-eviction":"2026-08-28T12:00:00Z"}
-
-# After completion the annotation is removed and deletion proceeds:
-kubectl get machine <machine-name> -n <ns>   # eventually NotFound
-```
-
-### Longhorn Node eviction status (workload cluster)
-
-```bash
-kubectl --kubeconfig <workload-kubeconfig> -n longhorn-system get node <nodeName> -o yaml
-# spec.allowScheduling should flip to false
-# spec.evictionRequested should flip to true
-# status.diskStatus[*].scheduledReplica / scheduledBackingImage drain to {}
-kubectl --kubeconfig <workload-kubeconfig> -n longhorn-system get lhn <nodeName> -o jsonpath='{.status.diskStatus}' | jq .
-```
-
-### Events on the Machine CR
-
-```bash
-kubectl get events -n <ns> --field-selector involvedObject.name=<machine-name>
-# Normal  LonghornEvictionComplete  Longhorn eviction complete for node <n>, releasing pre-terminate hook
-# Warning LonghornEvictionTimeout   Longhorn eviction timed out after 2h0m0s for node <n>; releasing hook
-```
-
-### Controller logs
-
-```bash
-kubectl -n longhorn-capi-system logs deploy/longhorn-capi-eviction-controller -f
-# Increase verbosity: add --zap-log-level=1 (or --zap-devel) to args for V(1) per-disk counts.
-```
-
----
-
-## Edge cases
-
-- **No `status.nodeRef`** — Machine never joined or already removed. No hook is set / hook is released immediately.
-- **Longhorn not installed** (`Node` CR 404) — hook released immediately.
-- **Workload cluster unreachable** — requeues at `poll-interval`, never releases early; timeout is the backstop.
-- **Controller restart** — timestamp in the annotation restores correct timeout accounting.
-- **Concurrent Machines** — each Machine has its own reconcile loop, independent workload clients.
-- **Anti-affinity stalls** — if replica anti-affinity cannot be satisfied on remaining nodes, eviction stalls until timeout. Check `V(1)` logs and Longhorn volume conditions; consider relaxing hard anti-affinity or adding capacity.
-- **Dead-node frozen diskStatus** — a departing node's longhorn-manager can die mid-eviction, freezing `diskStatus.scheduledReplica` with stale entries. The controller cross-checks the **Replica CRs** (authoritative): if no RUNNING replica remains on the node, eviction is treated as complete regardless of the frozen status.
-- **RWO pod holds the volume attached** — after hook release, CAPI can still stall at its native `WaitingForVolumeDetach` stage because attachments follow *pods*, not replicas. With `--evict-stuck-pods` (default on) the controller cordons the departing node and force-deletes non-DaemonSet pods holding non-faulted Longhorn PVCs so the volume detaches and the Machine delete completes.
-
-### Feature flags
-
-| Flag | Env | Default | Behavior |
+| Flag | Env | Default | Description |
 |---|---|---|---|
-| `--eviction-timeout` | `EVICTION_TIMEOUT` | 2h | Backstop: release the hook after this long even if eviction/rebuild is incomplete. **Recommend 4h+ for ≥500 GB volumes.** With early release active this is rarely hit. |
-| `--poll-interval` | `POLL_INTERVAL` | 15s | Reconcile cadence while a hook is held. |
-| `--longhorn-namespace` | `LONGHORN_NAMESPACE` | `longhorn-system` | Namespace of Longhorn in workload clusters. |
-| `--gc-interval` | `GC_INTERVAL` | 5m | Sweep cadence for orphaned `nodes.longhorn.io` CRs whose k8s Node is gone (stuck-finalizer workaround for longhorn/longhorn#6487). k8s Node list is the source of truth — a node whose k8s Node exists is never touched. |
-| `--early-release` | `EARLY_RELEASE` | `true` | Release the hook early when eviction drained but the rebuild is blocked only by the departing node's membership, **iff** every affected volume still has ≥ want−1 running replicas and none is faulted (degraded-but-safe). |
-| `--evict-stuck-pods` | `EVICT_STUCK_PODS` | `true` | After hook release: cordon the departing node and force-delete non-DaemonSet pods holding non-faulted Longhorn PVCs to release attachments. |
+| `--eviction-timeout` | `EVICTION_TIMEOUT` | `2h` | Backstop: release the hook after this long regardless of state. **Must exceed your largest single-volume rebuild time** — the Longhorn KB recommends ≥4h for ~500 GB volumes on on-prem hardware. With early release active, this is rarely hit. |
+| `--poll-interval` | `POLL_INTERVAL` | `15s` | Reconcile cadence while a hook is held. |
+| `--longhorn-namespace` | `LONGHORN_NAMESPACE` | `longhorn-system` | Where Longhorn lives in workload clusters. |
+| `--gc-interval` | `GC_INTERVAL` | `5m` | Sweep cadence for orphaned `nodes.longhorn.io` CRs. |
+| `--early-release` | `EARLY_RELEASE` | `true` | Release the hook before rebuild completes when every affected volume is degraded-but-safe (≥ want−1 live replicas, none faulted). See [Early release](#early-release-safety) below. |
+| `--evict-stuck-pods` | `EVICT_STUCK_PODS` | `true` | After hook release: cordon the departing node and delete non-DaemonSet pods holding non-faulted Longhorn PVCs, to clear CAPI's volume-detach stage. |
+| `--metrics-bind-address` | `METRICS_BIND_ADDRESS` | `:8080` | Metrics endpoint (`0` disables). |
+| `--health-probe-bind-address` | `HEALTH_PROBE_BIND_ADDRESS` | `:8081` | `/healthz`, `/readyz`. |
+| `--leader-elect` | `LEADER_ELECT` | `true` | Leader election (Lease, in the controller namespace). |
+
+### Early-release safety
+
+The default `--early-release=true` trades one level of redundancy for speed: instead of waiting for
+the full rebuild (which in 1-disk-per-node topologies *cannot start* until the departing node is
+gone), the hook is released once every affected volume still holds **≥ want−1 running replicas on
+surviving nodes and none is faulted**. Data remains at full replica-2 protection; the rebuild
+completes when the replacement node arrives.
+
+Set `--early-release=false` for strict behavior: the hook holds until every volume is at full
+replica count, or the timeout fires. Use this if your cluster regularly runs volumes with 1–2
+replicas where a further loss is unacceptable.
+
+### Sizing the eviction timeout
+
+With early release on, the timeout only matters when a volume is **faulted** or below want−1
+replicas — i.e., genuine trouble. Set it to comfortably exceed the rebuild time of your largest
+volume (bandwidth-bound: `volume size / replication bandwidth`). The Longhorn KB's guidance of ≥4h
+for ~500 GB volumes on on-prem hardware is a reasonable starting point.
 
 ---
 
-## Known issues
+## Operating
 
-- **Longhorn v1.12 — volumes stuck Degraded with zero rebuild** ([#13629](https://github.com/longhorn/longhorn/issues/13629), Aug 2026). Symptom: eviction completes but replicas never reschedule. Workaround is not in this controller; monitor Longhorn volume conditions after eviction.
-- **Longhorn v1.12 — V1 volumes may not rebuild after cluster shutdown** ([#13571](https://github.com/longhorn/longhorn/issues/13571), Jul 2026). Affects post-eviction rebuild, not eviction itself. Watch for stalled rebuilds after the node is finally deleted.
-- **Multiple disks** — eviction is only complete when **every** `status.diskStatus` entry is empty, per [Longhorn multi-disk docs](https://longhorn.io/docs/latest/nodes-and-volumes/nodes/multidisk/).
+### Watching a node replacement
+
+```bash
+# Hook lifecycle (management cluster):
+kubectl get machine <name> -n <ns> -o jsonpath='{.metadata.annotations}' | jq .
+#   "pre-terminate.delete.hook.machine.cluster.x-k8s.io/longhorn-node-eviction": "<RFC3339>"
+#   "longhorn-capi.sneezycats.io/hook-released": "<RFC3339>"   (after release; prevents re-arming)
+
+# Longhorn eviction progress (workload cluster):
+kubectl -n longhorn-system get nodes.longhorn.io <nodeName> -o yaml
+#   spec.allowScheduling → false, spec.evictionRequested → true, diskStatus drains
+
+# Events emitted on the Machine:
+#   Normal  LonghornEvictionComplete   eviction drained + rebuild gate satisfied
+#   Normal  LonghornEarlyRelease       released early (volumes degraded-but-safe)
+#   Normal  LonghornStuckPodEvicted    force-deleted pods to free a stuck attachment
+#   Normal  LonghornNodeGC             removed orphaned nodes.longhorn.io CRs
+#   Warning LonghornEvictionTimeout    backstop fired — investigate why
+```
+
+### Troubleshooting
+
+- **Machines stuck in `WaitingForPreTerminateHook`** — check the controller log. If it logs
+  `Failed to get Longhorn Node CR` or workload-client errors, the workload API is unreachable; the
+  timeout will eventually release, but fixing connectivity is better.
+- **Node stuck joining after replacement** — not this controller (its job ends at hook release).
+  Check `journalctl -u rancher-system-agent` on the VM: a
+  *"secret received was older than the last secret operated on"* plan-sync wedge is a known
+  rancher-system-agent behavior that self-recovers after its own restart (~20–30 min).
+- **`WaitingForVolumeDetach` for >2 min after hook release** — a workload pod holds the attachment.
+  With `--evict-stuck-pods` on, the controller clears it automatically; if it's disabled, drain the
+  pods manually or delete the pod.
+- **Volume stuck degraded with zero rebuild** — known Longhorn v1.12 issues
+  ([#13629](https://github.com/longhorn/longhorn/issues/13629)); check Longhorn's own conditions and
+  `LonghornReplicaRebuild` events, not this controller.
+
+---
+
+## Validation
+
+The controller has been validated end-to-end in a Harvester + Rancher + RKE2 lab (single Harvester
+host, RKE2 workload clusters, Longhorn 1.11.x) across these scenarios, all with **zero data loss and
+zero manual intervention**:
+
+| Scenario | Result |
+|---|---|
+| Rolling OS-image upgrade, 3 workers, dedicated Longhorn data disks | ✅ 2 hops, SL Micro 6.0→6.1→6.2 |
+| Rolling OS-image upgrade, 3 workers, **single-disk** (replicas on the boot disk) | ✅ 2 hops — full rebuild-from-replicas each hop |
+| Rolling upgrade, **5 workers** (odd) and **6 workers** (even) | ✅ sequential roll, identical behavior |
+| **Concurrent** deletion of 2 workers | ✅ independent per-machine reconcile, parallel join |
+| Worker deleted **during an active replica rebuild** of a degraded volume | ✅ safe — no faulted-volume edge hit |
+| Multiple volumes per cluster (5Gi + 10Gi + 20Gi) through replacement | ✅ gated independently, all healthy |
+| k8s **version-only** upgrade (RKE2 v1.34→v1.36) | ✅ in-place; controller correctly idle |
+| Controller pod restart before/during/after eviction | ✅ state recovered from Machine annotations |
+| Longhorn node-CR garbage collection (stuck finalizers) | ✅ orphans swept within `--gc-interval` |
+| Node-CR GC on clusters **without** Longhorn | ✅ skipped gracefully |
+
+Timing observations from that environment: worker replacement averages ~7–12 min (eviction →
+release → machine delete → replacement Ready → volume healthy), dominated by VM provisioning and
+join, not Longhorn rebuild. Known lab limits: single-host storage bandwidth, ≤23 GB of replicated
+data, and no multi-management-cluster scale testing.
 
 ---
 
@@ -160,12 +248,29 @@ kubectl -n longhorn-capi-system logs deploy/longhorn-capi-eviction-controller -f
 
 ```bash
 go vet ./...
-go build ./...             # requires Go 1.22+
-docker build -t ghcr.io/sneezycats/longhorn-capi-controller:dev .
+go build ./...
+go test ./internal/controller/ -v   # 11 unit tests covering the safety invariants
+docker build -t longhorn-capi-controller:dev .
 ```
 
-Third-party note: `github.com/longhorn/longhorn-manager` v1.8.1 imports `k8s.io/kubernetes v0.0.0` which is unresolvable. This repo vendors only `k8s/pkg/apis/longhorn/**` under `third_party/longhorn-manager` with a `replace` directive so `go mod tidy` stays clean without pulling the full Longhorn manager.
+The unit tests (`internal/controller/*_test.go`) cover the safety-critical invariants:
+
+- Node GC never touches a Longhorn node whose k8s Node exists (even NotReady)
+- GC unsticks stuck-deleting CRs and deletes orphans
+- Early release fires only on degraded-but-safe; **holds** on faulted volumes, replica deficits, and
+  already-complete volumes
+- EvictStuckPods deletes healthy-volume pods, **never** DaemonSet pods or pods holding faulted
+  volumes
+
+`prompt.md` in the repo root is the original design specification the Longhorn KB motivated — kept
+for provenance (it is git-ignored; see `notes.md` for the development log).
+
+**Note on Longhorn types:** `github.com/longhorn/longhorn-manager` v1.8.1 pulls an unresolvable
+`k8s.io/kubernetes` dependency, so this repo vendors `k8s/pkg/apis/longhorn/**` under
+`third_party/longhorn-manager` with a `replace` directive.
+
+---
 
 ## License
 
-Apache 2.0 — same as CAPI and Longhorn.
+Apache 2.0 — see [LICENSE](LICENSE).
