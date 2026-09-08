@@ -667,16 +667,14 @@ func (r *LonghornEvictionReconciler) releaseStuckAttachments(ctx context.Context
 		return // node already gone; nothing to release
 	}
 
-	// 2. Find pods on the node holding Longhorn PVCs.
-	podList := &corev1.PodList{}
-	if err := wlClient.List(ctx, podList, client.InNamespace(""), client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
-		// Fall back to a full list + filter (field selector may be unsupported
-		// for pods on some clients).
-		podList = &corev1.PodList{}
-		if err := wlClient.List(ctx, podList); err != nil {
-			l.Error(err, "EvictStuckPods: failed to list pods", "node", nodeName)
-			return
-		}
+	// 2. Find pods on the node holding Longhorn PVCs. Both the field-selector
+	// path and the full-list fallback can fail transiently when the workload
+	// API is churning mid-roll (control plane itself being replaced — observed
+	// in E15). Retry with a short bounded backoff before giving up this cycle.
+	podList, err := r.listPodsWithRetry(ctx, wlClient, nodeName)
+	if err != nil {
+		l.Error(err, "EvictStuckPods: failed to list pods after retries", "node", nodeName)
+		return
 	}
 
 	evicted := []string{}
@@ -719,6 +717,36 @@ func (r *LonghornEvictionReconciler) releaseStuckAttachments(ctx context.Context
 		r.emitEvent(machine, corev1.EventTypeNormal, "LonghornStuckPodEvicted",
 			fmt.Sprintf("Departing node %s: force-deleted Longhorn-PVC pods %v to release volume attachments (WaitingForVolumeDetach)", nodeName, evicted))
 	}
+}
+
+// listPodsWithRetry lists pods on the departing node with a short bounded
+// retry: first via the spec.nodeName field selector, falling back to a full
+// list + filter. Tolerates the transient API churn seen mid-roll (E15).
+func (r *LonghornEvictionReconciler) listPodsWithRetry(ctx context.Context, wlClient client.Client, nodeName string) (*corev1.PodList, error) {
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 2 * time.Second): // 2s, 4s, 6s
+			}
+		}
+		podList := &corev1.PodList{}
+		if err := wlClient.List(ctx, podList, client.InNamespace(""), client.MatchingFields{"spec.nodeName": nodeName}); err == nil {
+			return podList, nil
+		} else {
+			lastErr = err
+		}
+		// Fallback: full list + filter (field selector may be unsupported).
+		podList = &corev1.PodList{}
+		if err := wlClient.List(ctx, podList); err == nil {
+			return podList, nil
+		} else {
+			lastErr = err
+		}
+	}
+	return nil, lastErr
 }
 
 // isDaemonSetPod reports whether the pod is managed by a DaemonSet (by owner ref).
