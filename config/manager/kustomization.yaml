@@ -11,5 +11,5 @@ labels:
       app.kubernetes.io/managed-by: kustomize
     includeSelectors: false
 images:
-  - name: docker.io/mcclurken/longhorn-capi-controller
+  - name: ghcr.io/sneezycats/longhorn-capi-controller
     newTag: 0.9-alpha
