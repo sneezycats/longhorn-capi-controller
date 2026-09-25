@@ -6,6 +6,12 @@ metadata:
     app.kubernetes.io/name: longhorn-capi-controller
     app.kubernetes.io/component: controller
 rules:
+  # Rancher 2.14+: the workload-kubeconfig identity must read the management
+  # Cluster object for the /k8s/clusters/<c-m->/ proxy path.
+  - apiGroups: ["management.cattle.io"]
+    resources: ["clusters"]
+    verbs: ["get", "list"]
+
   # CAPI Machine CRs — core lifecycle.
   - apiGroups: ["cluster.x-k8s.io"]
     resources: ["machines"]

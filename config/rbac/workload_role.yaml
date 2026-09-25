@@ -58,6 +58,8 @@ roleRef:
   kind: ClusterRole
   name: longhorn-capi-eviction-workload
 subjects:
+  - kind: User
+    name: u-zssbnetv6a
   # Replace `name` / `namespace` with the ServiceAccount identity that appears
   # inside the workload cluster kubeconfig stored in the management cluster.
   # For the default CAPI kubeconfig this is typically the `capi-kubeadm-control-plane`
