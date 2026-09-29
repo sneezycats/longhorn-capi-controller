@@ -11,8 +11,9 @@ replacement logic does not wait for those replicas to be rebuilt on surviving no
 degraded — and if too many nodes are replaced concurrently, data is lost. The official
 [Longhorn KB: How to evict node during CAPI node rolling replacement](https://longhorn.io/kb/how-to-evict-node-during-capi-node-rolling-replacement/)
 documents the manual procedure. The Longhorn maintainers declined to ship a controller for it
-([longhorn/longhorn#12871](https://github.com/longhorn/longhorn/issues/12871): *"we don't implement
-such operator, KB is the guide"*) — this repository is that implementation.
+([longhorn/longhorn#12871](https://github.com/longhorn/longhorn/issues/12871): *"Per discussion,
+we don't implement such operator. Provided the KB as the development guide instead."*) — this
+repository is that implementation.
 
 > **Status:** running in production-shaped lab environments (Harvester + Rancher + RKE2) through
 > ~40 validated node replacements across OS upgrades (SL Micro 6.0→6.1→6.2), 1/3/5/6-worker
