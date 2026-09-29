@@ -35,7 +35,7 @@ const HookAnnotation = "pre-terminate.delete.hook.machine.cluster.x-k8s.io/longh
 // re-register the hook on every subsequent reconcile — re-arming the very
 // gate it just released (observed in E10: "Eviction timeout exceeded" followed
 // by endless re-registration while the machine sat in Deleting).
-const HookReleasedAnnotation = "longhorn-capi.sneezycats.io/hook-released"
+const HookReleasedAnnotation = "longhorn-capi.io/hook-released"
 
 // LonghornEvictionReconciler reconciles CAPI Machine objects to ensure
 // Longhorn replicas are fully evicted before the Machine is terminated.

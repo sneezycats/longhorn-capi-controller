@@ -190,7 +190,7 @@ for ~500 GB volumes on on-prem hardware is a reasonable starting point.
 # Hook lifecycle (management cluster):
 kubectl get machine <name> -n <ns> -o jsonpath='{.metadata.annotations}' | jq .
 #   "pre-terminate.delete.hook.machine.cluster.x-k8s.io/longhorn-node-eviction": "<RFC3339>"
-#   "longhorn-capi.sneezycats.io/hook-released": "<RFC3339>"   (after release; prevents re-arming)
+#   "longhorn-capi.io/hook-released": "<RFC3339>"   (after release; prevents re-arming)
 
 # Longhorn eviction progress (workload cluster):
 kubectl -n longhorn-system get nodes.longhorn.io <nodeName> -o yaml
