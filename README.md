@@ -81,9 +81,9 @@ stateless and safe to restart at any point.
 | Component | Tested with |
 |---|---|
 | CAPI | v1.10.x (`cluster.x-k8s.io/v1beta1` Machines) |
-| Longhorn | v1.11.x (v1 data engine) in workload clusters |
-| Management cluster | Rancher 2.15 provisioned RKE2 + Harvester node driver |
-| Workload clusters | RKE2 on Harvester VMs (SL Micro), single CP + 1–6 workers |
+| Longhorn | v1.11.x – v1.12.x (v1 data engine) in workload clusters |
+| Management cluster | Rancher 2.14.1 and 2.15.1, RKE2-provisioned + Harvester node driver |
+| Workload clusters | RKE2 on Harvester VMs (SL Micro 6.0–6.2), k8s v1.33.13 and v1.35.8 guests, single CP + 1–6 workers |
 | Go | 1.22+ to build |
 
 Should work with any CAPI provider that produces standard `Machine` CRs with `status.nodeRef` and
