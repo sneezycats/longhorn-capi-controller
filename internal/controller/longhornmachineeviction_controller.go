@@ -253,7 +253,7 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	// deleting) EVEN IF the evicting node's diskStatus hasn't drained yet. Holding the
 	// hook on eviction alone lets a stale stopped replica block until timeout; running
 	// cleanup independently unblocks the rebuild promptly.
-	delNodes, err := r.deletingNodeNames(ctx)
+	delNodes, err := r.deletingNodeNames(ctx, machine)
 	if err != nil {
 		l.Error(err, "Failed to enumerate deleting nodes — requeueing", "machine", machine.Name, "node", nodeName)
 		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
@@ -378,18 +378,28 @@ func (r *LonghornEvictionReconciler) nodeReplicasDrained(ctx context.Context, wl
 	return true, nil
 }
 
-// deletingNodeNames returns the set of node names that CAPI is currently deleting,
-// derived from Machines in the management cluster that have a deletionTimestamp AND
-// a non-nil status.nodeRef. This is a cluster-wide view so that replicas on ANY
-// doomed node are caught, not just the Machine that triggered this reconcile.
-func (r *LonghornEvictionReconciler) deletingNodeNames(ctx context.Context) (map[string]bool, error) {
+// deletingNodeNames returns the set of node names that CAPI is currently
+// deleting in the same workload cluster as the given Machine (machines in the
+// same namespace with the same spec.clusterName and a deletionTimestamp).
+//
+// The per-cluster scoping is a safety requirement, not an optimization: node
+// names are hostnames and are NOT unique across the workload clusters managed
+// by one management cluster. A machine being deleted in a DIFFERENT cluster
+// must never mark a same-named node of this cluster as doomed — that would
+// make cleanupBadReplicas force-delete replicas of a healthy node. Within the
+// cluster the view is still "any doomed node", not just the Machine that
+// triggered this reconcile.
+func (r *LonghornEvictionReconciler) deletingNodeNames(ctx context.Context, machine *clusterv1.Machine) (map[string]bool, error) {
 	machineList := &clusterv1.MachineList{}
-	if err := r.List(ctx, machineList); err != nil {
-		return nil, fmt.Errorf("listing machines to find deleting nodes: %w", err)
+	if err := r.List(ctx, machineList, client.InNamespace(machine.Namespace)); err != nil {
+		return nil, fmt.Errorf("listing machines in %s: %w", machine.Namespace, err)
 	}
 	out := map[string]bool{}
 	for i := range machineList.Items {
 		m := &machineList.Items[i]
+		if m.Spec.ClusterName != machine.Spec.ClusterName {
+			continue
+		}
 		if m.DeletionTimestamp == nil || m.DeletionTimestamp.IsZero() {
 			continue
 		}
@@ -403,18 +413,38 @@ func (r *LonghornEvictionReconciler) deletingNodeNames(ctx context.Context) (map
 // cleanupBadReplicas deletes replicas that are "bad" and thus block a clean rebuild:
 //
 //	(a) any replica (running or stopped) on a node CAPI is deleting (doomed), and
-//	(b) any STOPPED replica whose node is no longer a live, ready Longhorn node
-//	    (gone/NotReady) — observed as the stale `stopped` replica that kept a volume
-//	    at 3 "healthy" replicas while one never left a doomed node and the rebuild
-//	    stalled (longhorn-maintenance-behavior.md E6).
+//	(b) any STOPPED, inactive replica whose node is gone from the workload
+//	    cluster — no live Longhorn Node CR AND no k8s Node. Observed as the
+//	    stale `stopped` replica that kept a volume at 3 "healthy" replicas
+//	    while one never left a doomed node and the rebuild stalled
+//	    (longhorn-maintenance-behavior.md E6).
+//
+// A node that merely reports NotReady, or is unschedulable (allowScheduling=false —
+// which this controller itself sets when triggering eviction), is NOT gone: replica
+// cleanup follows the same source of truth as the Node GC — the k8s Node list —
+// so anything still present in the cluster is left to Longhorn's own eviction.
+//
+// Safety: a replica is never deleted if that would leave its volume with zero
+// running replicas on nodes that are not being deleted — i.e. it is the volume's
+// last live copy. Single-replica volumes are the obvious case (Harvester's
+// default storage class is one): Longhorn's own eviction migrates such a
+// replica safely given time, while deleting it destroys the data. Volumes whose
+// Volume CR no longer exists are garbage and exempt from this protection.
 //
 // Returns (removedNames, affectedVolumes). Runs regardless of eviction drain state so
 // the rebuild is unblocked promptly rather than waiting out the eviction timeout.
 func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (removed []string, affected []string, err error) {
+	l := log.FromContext(ctx)
+
 	// Live, scheduling-eligible Longhorn node hostnames (targets for a rebuild).
 	liveNodes, err := r.liveNodeNames(ctx, wlClient)
 	if err != nil {
 		return nil, nil, fmt.Errorf("listing live Longhorn nodes: %w", err)
+	}
+	// k8s Node names — the authoritative "does this node still exist" signal.
+	k8sNodes, err := r.k8sNodeNames(ctx, wlClient)
+	if err != nil {
+		return nil, nil, fmt.Errorf("listing k8s nodes: %w", err)
 	}
 
 	replicaList := &longhornv1beta2.ReplicaList{}
@@ -422,22 +452,49 @@ func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlC
 		return nil, nil, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
 	}
 
+	// Pass 1: classify deletion candidates and count the running replicas each
+	// volume keeps on nodes that are not being deleted (the surviving data).
+	type candidate struct {
+		rep  *longhornv1beta2.Replica
+		doom bool
+	}
+	var candidates []candidate
+	liveByVolume := map[string]int{}
 	affectedVolumes := map[string]bool{}
 	for i := range replicaList.Items {
 		rep := &replicaList.Items[i]
-		nodeID := rep.Spec.NodeID
 		volName := volumeNameFromReplica(rep)
-		if volName != "" {
+		nodeID := rep.Spec.NodeID
+		doom := nodeID == departingNode || deletingNodes[nodeID]
+		gone := nodeID != "" && !liveNodes[nodeID] && !k8sNodes[nodeID] && !rep.Spec.Active
+		if doom || gone {
 			affectedVolumes[volName] = true
-		}
-		doomed := nodeID == departingNode || deletingNodes[nodeID]
-		onGoneNode := nodeID != "" && !liveNodes[nodeID] && !rep.Spec.Active
-		if !doomed && !onGoneNode {
+			candidates = append(candidates, candidate{rep: rep, doom: doom})
 			continue
 		}
-		l := log.FromContext(ctx)
+		if isReplicaRunning(*rep) {
+			liveByVolume[volName]++
+		}
+	}
+
+	// Pass 2: delete candidates, refusing to destroy a volume's last live copy.
+	for _, c := range candidates {
+		rep := c.rep
+		volName := volumeNameFromReplica(rep)
+		if volName != "" {
+			vol := &longhornv1beta2.Volume{}
+			volErr := wlClient.Get(ctx, types.NamespacedName{Name: volName, Namespace: r.LonghornNS}, vol)
+			if volErr != nil && !apierrors.IsNotFound(volErr) {
+				return nil, nil, fmt.Errorf("getting volume %s: %w", volName, volErr)
+			}
+			if volErr == nil && liveByVolume[volName] == 0 {
+				l.Info("Refusing to delete a volume's last live replica — leaving it for Longhorn's own eviction/rebuild",
+					"replica", rep.Name, "node", rep.Spec.NodeID, "volume", volName)
+				continue
+			}
+		}
 		l.Info("Deleting bad replica to force a clean rebuild",
-			"replica", rep.Name, "node", nodeID, "volume", volName, "doomed", doomed, "onGoneNode", onGoneNode)
+			"replica", rep.Name, "node", rep.Spec.NodeID, "volume", volName, "doomed", c.doom)
 		if err := wlClient.Delete(ctx, rep); err != nil && !apierrors.IsNotFound(err) {
 			return nil, nil, fmt.Errorf("deleting bad replica %s: %w", rep.Name, err)
 		}
@@ -470,6 +527,22 @@ func (r *LonghornEvictionReconciler) liveNodeNames(ctx context.Context, wlClient
 		if ready == longhornv1beta2.ConditionStatusTrue {
 			out[n.Spec.Name] = true
 		}
+	}
+	return out, nil
+}
+
+// k8sNodeNames returns the set of Kubernetes Node names in the workload
+// cluster. Replica cleanup uses it as the authoritative existence signal —
+// the same source of truth as the Node GC: a node whose k8s Node still
+// exists (even NotReady, even cordoned) is never treated as gone.
+func (r *LonghornEvictionReconciler) k8sNodeNames(ctx context.Context, wlClient client.Client) (map[string]bool, error) {
+	k8sNodeList := &corev1.NodeList{}
+	if err := wlClient.List(ctx, k8sNodeList); err != nil {
+		return nil, fmt.Errorf("listing k8s nodes: %w", err)
+	}
+	out := map[string]bool{}
+	for i := range k8sNodeList.Items {
+		out[k8sNodeList.Items[i].Name] = true
 	}
 	return out, nil
 }
