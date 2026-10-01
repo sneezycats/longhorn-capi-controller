@@ -8,6 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
+	longhornv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -75,7 +76,6 @@ func TestRelocateRaisesWantForLastReplicaVolume(t *testing.T) {
 		t.Fatal("expected relocation to fire for a last-replica volume")
 	}
 	vol = getVolAfter(t, c, "pvc-x")
-	vol = getVolAfter(t, c, "pvc-x")
 	if vol.Spec.NumberOfReplicas != 2 {
 		t.Fatalf("expected want raised 1→2, got %d", vol.Spec.NumberOfReplicas)
 	}
@@ -105,7 +105,6 @@ func TestRelocateSkipsWhenSurvivorHoldsData(t *testing.T) {
 	if relocated {
 		t.Fatal("expected no relocation when a survivor holds the data")
 	}
-	vol = getVolAfter(t, c, "pvc-x")
 	vol = getVolAfter(t, c, "pvc-x")
 	if vol.Spec.NumberOfReplicas != 1 {
 		t.Fatalf("expected want untouched, got %d", vol.Spec.NumberOfReplicas)
@@ -138,7 +137,6 @@ func TestRelocateIdempotentViaAnnotation(t *testing.T) {
 		t.Fatal("second pass must be a no-op (idempotent)")
 	}
 	vol = getVolAfter(t, c, "pvc-x")
-	vol = getVolAfter(t, c, "pvc-x")
 	if vol.Spec.NumberOfReplicas != 2 {
 		t.Fatalf("expected want to stay at 2 after repeat pass, got %d", vol.Spec.NumberOfReplicas)
 	}
@@ -163,7 +161,6 @@ func TestRelocateNoOpWhenDoomedReplicaHoldsNoData(t *testing.T) {
 	if relocated {
 		t.Fatal("expected no relocation for a data-less doomed replica")
 	}
-	vol = getVolAfter(t, c, "pvc-x")
 	vol = getVolAfter(t, c, "pvc-x")
 	if vol.Spec.NumberOfReplicas != 1 {
 		t.Fatalf("expected want untouched, got %d", vol.Spec.NumberOfReplicas)
@@ -201,7 +198,6 @@ func TestRestoreReplicaWantsRestoresCount(t *testing.T) {
 
 	r.restoreReplicaWants(context.Background(), c, machine)
 	vol = getVolAfter(t, c, "pvc-x")
-	vol = getVolAfter(t, c, "pvc-x")
 	if vol.Spec.NumberOfReplicas != 1 {
 		t.Fatalf("expected want restored to 1, got %d", vol.Spec.NumberOfReplicas)
 	}
@@ -219,7 +215,6 @@ func TestRestoreSkipsWhenAlreadyAtOriginal(t *testing.T) {
 
 	r.restoreReplicaWants(context.Background(), c, machine)
 	vol = getVolAfter(t, c, "pvc-x")
-	vol = getVolAfter(t, c, "pvc-x")
 	if vol.Spec.NumberOfReplicas != 1 {
 		t.Fatalf("expected want to stay at 1, got %d", vol.Spec.NumberOfReplicas)
 	}
@@ -236,7 +231,6 @@ func TestRestoreNoopWithoutAnnotation(t *testing.T) {
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system", APIReader: c}
 
 	r.restoreReplicaWants(context.Background(), c, machine)
-	vol = getVolAfter(t, c, "pvc-x")
 	vol = getVolAfter(t, c, "pvc-x")
 	if vol.Spec.NumberOfReplicas != 5 {
 		t.Fatalf("expected want untouched, got %d", vol.Spec.NumberOfReplicas)
