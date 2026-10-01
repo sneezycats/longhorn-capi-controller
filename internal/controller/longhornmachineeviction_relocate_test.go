@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/runtime"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
@@ -21,6 +23,17 @@ import (
 // source replica failed anyway (salvage from the intact disk), and restore the
 // original count on release.
 
+// evRelocateScheme: evScheme plus the Cluster-API Machine type (the relocation
+// patch writes a Machine annotation through the same client).
+func evRelocateScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	s := evRelocateScheme(t)
+	if err := clusterv1.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
 // mkDelMachine: mkMachine with a finalizer so the fake client accepts a
 // machine carrying a deletionTimestamp (refused otherwise).
 func mkDelMachine(nodeName string) *clusterv1.Machine {
@@ -33,7 +46,7 @@ func mkDelMachine(nodeName string) *clusterv1.Machine {
 // data-holding replica sits on the departing node gets its replica count
 // raised (1→2) and the original recorded on the Machine annotation.
 func TestRelocateRaisesWantForLastReplicaVolume(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "")
 	machine := mkDelMachine("node-departing")
@@ -61,7 +74,7 @@ func TestRelocateRaisesWantForLastReplicaVolume(t *testing.T) {
 // surviving node there is nothing to relocate — the count is untouched and no
 // annotation is recorded.
 func TestRelocateSkipsWhenSurvivorHoldsData(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "")
 	survivor := mkReplica("pvc-x", "node-alive", "running", "")
@@ -88,7 +101,7 @@ func TestRelocateSkipsWhenSurvivorHoldsData(t *testing.T) {
 // TestRelocateIdempotentViaAnnotation: a second pass (next poll) must not
 // double-raise; the annotation is the idempotence guard.
 func TestRelocateIdempotentViaAnnotation(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "")
 	machine := mkDelMachine("node-departing")
@@ -115,7 +128,7 @@ func TestRelocateIdempotentViaAnnotation(t *testing.T) {
 // TestRelocateNoOpWhenDoomedReplicaHoldsNoData: a stopped (data-less) doomed
 // replica is garbage — no relocation should fire for it.
 func TestRelocateNoOpWhenDoomedReplicaHoldsNoData(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	garbage := mkReplica("pvc-x", "node-departing", "stopped", "")
 	garbage.Spec.HealthyAt = ""
@@ -139,7 +152,7 @@ func TestRelocateNoOpWhenDoomedReplicaHoldsNoData(t *testing.T) {
 // TestRelocateSkipsWhenVolumeGone: a deleted volume's replica is not a
 // relocation candidate.
 func TestRelocateSkipsWhenVolumeGone(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	src := mkReplica("pvc-gone", "node-departing", "running", "")
 	machine := mkDelMachine("node-departing")
 
@@ -157,7 +170,7 @@ func TestRelocateSkipsWhenVolumeGone(t *testing.T) {
 // TestRestoreReplicaWantsRestoresCount: the release path restores the recorded
 // original count.
 func TestRestoreReplicaWantsRestoresCount(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 2, "healthy")
 	machine := mkDelMachine("node-departing")
 	machine.Annotations[ReplicaScaleOrigAnnotation] = "pvc-x=1"
@@ -173,7 +186,7 @@ func TestRestoreReplicaWantsRestoresCount(t *testing.T) {
 
 // TestRestoreSkipsWhenAlreadyAtOriginal: idempotent — no churn on repeat.
 func TestRestoreSkipsWhenAlreadyAtOriginal(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "healthy")
 	machine := mkDelMachine("node-departing")
 	machine.Annotations[ReplicaScaleOrigAnnotation] = "pvc-x=1"
@@ -190,7 +203,7 @@ func TestRestoreSkipsWhenAlreadyAtOriginal(t *testing.T) {
 // TestRestoreNoopWithoutAnnotation: machines without the annotation cost
 // nothing.
 func TestRestoreNoopWithoutAnnotation(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 5, "healthy")
 	machine := mkDelMachine("node-departing")
 
@@ -208,7 +221,7 @@ func TestRestoreNoopWithoutAnnotation(t *testing.T) {
 // node still exists cordoned — the controller uncordons it so Longhorn can
 // recreate the instance manager and salvage the replica from its intact disk.
 func TestHealUncordonsFailedSourceNode(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "2026-10-01T20:10:18Z")
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-departing"}}
@@ -232,7 +245,7 @@ func TestHealUncordonsFailedSourceNode(t *testing.T) {
 // TestHealSkipsWhenSurvivorHoldsData: no urgency when a surviving replica
 // already holds the data — the node stays cordoned.
 func TestHealSkipsWhenSurvivorHoldsData(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 2, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "2026-10-01T20:10:18Z")
 	survivor := mkReplica("pvc-x", "node-alive", "running", "")
@@ -257,7 +270,7 @@ func TestHealSkipsWhenSurvivorHoldsData(t *testing.T) {
 // TestHealSkipsWhenNodeGone: a failed source replica whose node no longer
 // exists in the workload cluster is beyond salvage — nothing to do.
 func TestHealSkipsWhenNodeGone(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-gone", "running", "2026-10-01T20:10:18Z")
 
@@ -276,7 +289,7 @@ func TestHealSkipsWhenNodeGone(t *testing.T) {
 // TestHealSkipsWhenUncordoned: the node is up and schedulable — Longhorn's own
 // salvage machinery is free to act; the controller does nothing.
 func TestHealSkipsWhenUncordoned(t *testing.T) {
-	s := evScheme(t)
+	s := evRelocateScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "2026-10-01T20:10:18Z")
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node-departing"}}
