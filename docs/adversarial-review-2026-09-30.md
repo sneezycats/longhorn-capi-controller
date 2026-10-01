@@ -153,5 +153,10 @@ Noted, deliberately left (behavior changes / cosmetic):
 | `af81bbe` | SEC-4, build/docs hygiene, README accuracy |
 | `9104955` | review record + test plan |
 | (this commit) | CRIT-1a: data-holding survivor predicate (`HealthyAt`), want=1 release-gate fix, regression tests |
+| `041f0a2` +tests | CRIT-1b: immediate last-replica relocation (`relocateLastReplicas` — raise `spec.numberOfReplicas` by doomed data-holding count at hook registration, restore via `restoreReplicaWants` on every release path), failed-source heal (`healFailedSourceReplicas`), workload RBAC `volumes patch`, 13 regression tests (28/28 suite) |
+
+### CRIT-1b validation (round 4, 2026-10-01)
+
+Full details in `docs/validation-results-2026-10-01.md` §Round 4. Summary: controlled UPD-1-geometry delete **saved** (rebuild won the 21s race, zero workload disruption); in the real 6.1→6.2 machine-set roll, one worker hop **saved** (22:18) and one **lost** (22:24 — teardown 21s beat the ~25–30s rebuild; idle guest died fast). Multi-replica volumes survived the entire 6.0→6.1→6.2 cycle with verified data continuity. **Residual:** single-replica volumes retain a data-loss risk against the hook-blind VM teardown that no workload-cluster-side controller can eliminate — documented as a known limitation; the runbook's recommendation is that single-replica SCs must not hold roll-survival-critical data. The least-privilege workload RBAC was applied as a ClusterRole but the lab identity remains bound to `cluster-owner` — repointing the binding is a maintainer follow-up.
 
 **Status:** branch pushed, not merged, no PR. Validation of these changes is specified in `docs/test-plan-2026-09-30.md` and must run before merge.

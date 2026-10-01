@@ -80,5 +80,27 @@ The rep1 volume's only data-holding replica died **with the jnt4m VM**: machine 
 - Evidence (round 1): `build:~/scratch/lhcc-review-test-2026-10-01/` — `stage0-static.txt`, `s1-*`, `s2-run.txt`, `s2-verify.txt`, `s2-controller-full.log`.
 - Evidence (round 2): `build:~/scratch/lhcc-review-retest-2026-10-01/` — `s1-run.txt`, `s1-verify.txt`, `s2-run.txt`, `s2-verify.txt`, `s2fix1-controller-full.log`.
 - Evidence (round 3): `build:~/scratch/lhcc-upgrade-cycle-2026-10-01/` — `roll-6.1-part1/2/3.txt`, `cycle-controller-full.log`, `roll-6.1-rep1-watch.txt`, `interventions.txt`.
+- Evidence (round 4, same dir): `retest-a-7ftj5.txt` (controlled UPD-1-geometry save), `roll-6.2-part1/2/3.txt` (full 6.1→6.2 roll: 2 saves + 1 teardown-beat-rebuild loss).
 - Operator runbook with as-built details: lab-docs repo `docs/longhorn/lhcc-review-branch-validation-runbook.md` (§Test-execution log, §Retest round).
 - Branch tip at writing: `c8edc06` (GitHub + Forgejo in sync). Old image tag `adversarial-review-2026-09-30` remains published pending maintainer retirement.
+
+## Round 4 — CRIT-1b fix implemented and rolled (2026-10-01, 21:50–22:36 UTC)
+
+**Fix deployed:** branch commit `041f0a2` (+test commits, tip `432a68f`) implements relocation:
+- `relocateLastReplicas` — at hook registration, for every volume whose ONLY data-holding replicas sit on nodes CAPI is deleting: record the original `spec.numberOfReplicas` on the Machine (`longhorn-capi.io/replica-scale-orig` annotation) and raise the count by the number of doomed data-holding replicas → Longhorn's standard scheduling rebuilds a replacement onto a surviving node immediately. Idempotent via the annotation.
+- `restoreReplicaWants` — restores raised counts from every release path (timeout / no-NodeRef / LH-node-gone / early / complete / post-release 0.8 lingering).
+- `healFailedSourceReplicas` — uncordons a still-existing node whose data-bearing replica failed mid-relocation (LH can recreate the IM and salvage from the intact disk).
+- RBAC: workload ClusterRole gains `volumes patch`. 13 new unit tests; suite 28/28, gofmt/vet clean.
+- Image: `ghcr.io/sneezycats/longhorn-capi-controller:adversarial-review-2026-09-30-c1bfix1` (digest `sha256:6058f032…`). NOTE: the lab controller identity is bound to `cluster-owner` (the least-privilege ClusterRole exists but the ClusterRoleBinding was never repointed) — the relocation patches exercised admin perms; RBAC least-privilege remains an open maintainer item.
+
+**Retest A — controlled UPD-1 geometry (manual machine delete, 21:58):** SAVE. Hook+eviction 21:58:45, refusal held, relocation raised want 1→2 at 21:58:46, LH scheduled the replacement 21:59:01, rebuild DONE 21:59:06 (21s), doomed source died with the VM at 21:59:17 — no matter. Early release + want restored to 1 at 21:59:32; machine finalized; volume healthy; writer IO uninterrupted end-to-end (its attachment never moved — exactly the geometry that lost in round 3).
+
+**Full 6.1→6.2 roll (commit `e21e797`, 22:08–22:32):** the machine-set replaced BOTH pools (workers 2qtrv→ldn5c, CPs 56l7z→new). 5 hops observed:
+- CP hops: hook → immediate release (no Longhorn node CR). Clean.
+- Worker hop 22:13: multi-replica volumes degraded-but-safe → fast release. Clean.
+- Worker hop 22:18: relocation SAVE — Refusing→Relocated 22:18:40 → refusals held → doomed replica deleted + early release + count restored 22:19:26. Volumes back to healthy 22:20:58.
+- **Worker hop 22:24 (last old worker `j29hk`, single-replica volume): LOSS by ~5s.** Fix fired correctly (Refusing + Relocated at 22:24:30, want 1→2), but this VM's teardown was unusually fast — VMI deleted 22:24:51, **21s after the relocation** (prior teardowns: 32s, 46s, ~104s) — the rebuild (~25–30s incl. scheduling) was still in flight when the source disk died. Volume faulted/detached; salvage impossible (kubelet died with the VM; the heal's precondition — a live guest — was already gone). Hook held until manual release 22:31:24; rep1 fixture PVC deleted.
+
+**Cycle final state:** 6/6 machines+nodes on SLE Micro 16.0 (=6.2 image), all Ready; 3 multi-replica volumes healthy/attached with **md5 probe + 64MB probe clean and counters advancing (seq 22–31) across THREE pool generations** (sb2fw 6.0 → 2qtrv 6.1 → ldn5c 6.2); controller 1/1 Running throughout, zero timeouts, zero crash-restarts; no FAULTED on any scenario-predicted-healthy volume.
+
+**Verdict (updated from round 3's design directions):** direction (a) was implemented as relocation — it converts the 1-replica roll-flow window from "LH eviction must fire (rare)" to "rebuild must beat the VM teardown (~21–46s observed, 3 saves / 1 loss)". **The race cannot be closed from inside the workload cluster**: the VM deletion is hook-blind, the disk dies with the VM, and teardown duration is guest-dependent (idle guests die faster). Direction (c) is now a hard recommendation: single-replica storage classes must never hold data that must survive rolling upgrades; the test SC is single-replica precisely to exercise this edge. Residual 1-replica risk should be surfaced in the README as a known limitation.
