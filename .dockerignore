@@ -1,0 +1,12 @@
+.git
+.gitignore
+Dockerfile
+.dockerignore
+Makefile
+README.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE
+notes.md
+prompt.md
+config/

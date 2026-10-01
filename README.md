@@ -39,10 +39,12 @@ Machine deletion detected
                  ├─ diskStatus empty on the node, OR
                  └─ authoritative cross-check: no RUNNING replica CRs remain on
                     the node (covers the dead-manager frozen-status case)
-                      └─► replica-rebuild gate
-                           ├─ all affected volumes have their full replica
+                      └─► replica-rebuild gate (scope: every volume in
+                           the Longhorn namespace — deliberately
+                           conservative)
+                           ├─ all volumes at their full replica
                            │  count on non-deleting nodes → release, or
-                           └─ EARLY RELEASE: every affected volume still has
+                           └─ EARLY RELEASE: every volume still has
                               ≥ want−1 replicas on surviving nodes and none is
                               faulted → release now (degraded-but-safe; the
                               rebuild cannot proceed until the departing node
@@ -66,9 +68,13 @@ stateless and safe to restart at any point.
 - **Frozen-status cross-check:** a departing node's longhorn-manager can die mid-eviction, leaving
   its `diskStatus.scheduledReplica` map stale forever. The controller treats the Replica CRs as the
   authoritative source and will not wait on a dead node's self-reported status.
-- **Bad-replica cleanup:** a running replica on *any* CAPI-deleting node (including a different
-  node than the one being evicted) is deleted to force a clean rebuild — closes the
-  "volume looks healthy but a replica lives on a doomed node" trap.
+- **Bad-replica cleanup:** a replica on *any* CAPI-deleting node in the same workload cluster
+  (including a different node than the one being evicted) is deleted to force a clean rebuild —
+  closes the "volume looks healthy but a replica lives on a doomed node" trap. Two rails bound
+  it: a replica is never deleted when it is its volume's **last running copy** on non-deleting
+  nodes (single-replica volumes are the worst case — Longhorn's own eviction migrates those),
+  and a node only counts as "gone" when its k8s Node is absent — a merely NotReady or cordoned
+  node keeps its replicas (the same source of truth as the Node GC).
 - **Node-CR garbage collection:** Longhorn fails to remove `nodes.longhorn.io` CRs for nodes that
   died before deletion ([longhorn/longhorn#6487](https://github.com/longhorn/longhorn/issues/6487),
   wontfix). The GC removes them, using the k8s Node list as the source of truth: a Longhorn node
@@ -84,7 +90,7 @@ stateless and safe to restart at any point.
 | Longhorn | v1.11.x – v1.12.x (v1 data engine) in workload clusters |
 | Management cluster | Rancher 2.14.1 and 2.15.1, RKE2-provisioned + Harvester node driver |
 | Workload clusters | RKE2 on Harvester VMs (SL Micro 6.0–6.2), k8s v1.33.13 and v1.35.8 guests, single CP + 1–6 workers |
-| Go | 1.22+ to build |
+| Go | 1.27 (as required by `go.mod`; `GOTOOLCHAIN=auto` fetches it on 1.21+) |
 
 Should work with any CAPI provider that produces standard `Machine` CRs with `status.nodeRef` and
 per-cluster kubeconfig Secrets (kubeadm, RKE2, Talos providers, etc.). Non-Rancher setups are
@@ -100,7 +106,8 @@ untested — reports welcome.
 2. Longhorn installed in each workload cluster whose nodes you want protected.
 3. Workload cluster kubeconfigs stored as Secrets named `<cluster-name>-kubeconfig`, in the same
    namespace as the Machines, with the raw kubeconfig under the `value` key (the standard CAPI
-   convention — CAPI creates these automatically).
+   convention — CAPI creates these automatically). The controller reads them directly from the
+   API with `get`-only RBAC — no Secret is ever cached in-process.
 
 ### 1. Deploy to the management cluster
 
@@ -256,6 +263,7 @@ go vet ./...
 go build ./...
 go test ./internal/controller/ -v   # 11 unit tests covering the safety invariants
 docker build -t longhorn-capi-controller:dev .
+# or simply: make build test vet vuln   (see Makefile)
 ```
 
 The unit tests (`internal/controller/*_test.go`) cover the safety-critical invariants:
