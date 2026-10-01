@@ -3,7 +3,7 @@
 - **Reviewed:** `main @ 8c39a24` (state published to GitHub 2026-09-29)
 - **Fixes:** branch `adversarial-review-2026-09-30` (commit map at the end)
 - **Method:** static review only — no tests executed, no code run. Tooling: `govulncheck` (symbol-level reachability), `go vet` (type-check), `gofmt`, live container-registry digest resolution, secrets/credential sweep of all tracked files.
-- **Validation:** `docs/test-plan-2026-09-30.md`
+- **Validation:** `docs/test-plan-2026-09-30.md` · **Results:** `docs/validation-results-2026-10-01.md`
 
 Provenance note: at review time the GitHub web UI intermittently displayed the repository as empty; the GitHub API confirmed content (pushed 2026-09-29T15:10:03Z, default branch `main`, 120 KB). The reviewed clone was in sync with `origin/main`.
 
