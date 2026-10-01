@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +36,15 @@ const HookAnnotation = "pre-terminate.delete.hook.machine.cluster.x-k8s.io/longh
 // gate it just released (observed in E10: "Eviction timeout exceeded" followed
 // by endless re-registration while the machine sat in Deleting).
 const HookReleasedAnnotation = "longhorn-capi.io/hook-released"
+
+// ReplicaScaleOrigAnnotation records, per Machine, the ORIGINAL
+// spec.numberOfReplicas of volumes whose replica count this controller
+// temporarily raised to force an immediate replacement-replica rebuild onto a
+// surviving node (CRIT-1b fix). Format: comma-separated "volumeName=origWant".
+// The raise is transient: restoreReplicaWants reapplies the recorded count from
+// every hook-release path. Idempotence guard as well — a recorded volume is
+// never raised twice.
+const ReplicaScaleOrigAnnotation = "longhorn-capi.io/replica-scale-orig"
 
 // LonghornEvictionReconciler reconciles CAPI Machine objects to ensure
 // Longhorn replicas are fully evicted before the Machine is terminated.
@@ -127,14 +137,16 @@ func (r *LonghornEvictionReconciler) handleDeletionDetected(ctx context.Context,
 		// volume's ATTACHMENT (attachments follow pods, not replicas). If
 		// enabled, cordon the node and force-delete Longhorn-PVC-backed pods
 		// so the volume detaches and CAPI can finish.
-		if r.EvictStuckPods {
-			// Build the workload client here; the release path may run long
-			// after the hook reconciliation that had one.
-			if wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace); err == nil {
+		// CRIT-1b: restore any temporarily-raised replica counts before
+		// whatever remains of this deletion proceeds — the raise is transient
+		// and must not outlive the migration.
+		if wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace); err == nil {
+			r.restoreReplicaWants(ctx, wlClient, machine)
+			if r.EvictStuckPods {
 				r.releaseStuckAttachments(ctx, wlClient, machine)
-			} else {
-				log.FromContext(ctx).V(1).Info("EvictStuckPods: no workload client yet", "machine", machine.Name, "err", err.Error())
 			}
+		} else {
+			log.FromContext(ctx).V(1).Info("Post-release: no workload client yet", "machine", machine.Name, "err", err.Error())
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -187,6 +199,9 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 			"elapsed", elapsed, "timeout", r.EvictionTimeout)
 		r.emitEvent(machine, corev1.EventTypeWarning, "LonghornEvictionTimeout",
 			fmt.Sprintf("Longhorn eviction timed out after %s for node %s; releasing pre-terminate hook to unblock CAPI deletion", elapsed.Truncate(time.Second), nodeName))
+		// CRIT-1b: restore raised replica counts before releasing (best-effort;
+		// the release must proceed regardless).
+		r.restoreReplicaWants(ctx, nil, machine)
 		if err := r.removeHook(ctx, machine); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -196,6 +211,7 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	// 2. Handle missing NodeRef post-hook (edge: node deleted after hook was set).
 	if nodeName == "" {
 		l.Info("Machine NodeRef is nil while hook is registered — releasing hook", "machine", machine.Name)
+		r.restoreReplicaWants(ctx, nil, machine)
 		if err := r.removeHook(ctx, machine); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -217,6 +233,7 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 		if apierrors.IsNotFound(err) {
 			l.Info("Longhorn Node CR not found — assuming Longhorn not installed or already cleaned up, releasing hook",
 				"machine", machine.Name, "node", nodeName, "cluster", clusterName)
+			r.restoreReplicaWants(ctx, wlClient, machine)
 			if err := r.removeHook(ctx, machine); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -274,6 +291,43 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 			"machine", machine.Name, "node", nodeName, "removed", removed)
 	}
 
+	// CRIT-1b: volumes whose ONLY data-holding replicas sit on nodes CAPI is
+	// deleting must get a replacement replica scheduled IMMEDIATELY — Longhorn
+	// eviction only replenishes promptly when the volume is attached to the
+	// departing node, and the machine-set roll flow deletes the infra VM
+	// hook-blind seconds after the deletion starts, killing the source replica
+	// mid-migration (UPD-1: the unattached geometry lost the volume). Raising
+	// the volume's replica count makes Longhorn's standard scheduling rebuild
+	// a copy on a surviving node right away; the original count is restored
+	// once the doomed replica is gone (restoreReplicaWants, wired into every
+	// release path). The existing HealthyAt guards keep the hook held until
+	// the replacement actually holds the volume's data.
+	relocated, err := r.relocateLastReplicas(ctx, wlClient, machine, nodeName, delNodes)
+	if err != nil {
+		l.Error(err, "Failed to relocate last-replica volumes — requeueing", "machine", machine.Name, "node", nodeName)
+		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+	}
+	if relocated {
+		l.Info("Relocated last-replica volume(s) — raised replica counts to force immediate rebuild onto surviving nodes",
+			"machine", machine.Name, "node", nodeName)
+	}
+
+	// CRIT-1b heal: if a data-bearing source replica already FAILED (drain or
+	// teardown killed its instance manager) while the volume still has no
+	// data-holding copy elsewhere, uncordon its node if the node still exists —
+	// Longhorn then recreates the instance manager and auto-salvage can
+	// restart the replica from its intact disk, letting the in-flight rebuild
+	// resume before the VM is torn down (observed shutdown grace: ~100s).
+	healed, err := r.healFailedSourceReplicas(ctx, wlClient, nodeName, delNodes)
+	if err != nil {
+		l.Error(err, "Failed to evaluate failed-source-replica heal — requeueing", "machine", machine.Name, "node", nodeName)
+		return ctrl.Result{RequeueAfter: r.PollInterval}, nil
+	}
+	if healed {
+		l.Info("Uncordoned node with failed source replica — Longhorn salvage/rebuild can resume",
+			"machine", machine.Name, "node", nodeName)
+	}
+
 	// Now check eviction drain state. If the node's self-reported diskStatus
 	// still lists scheduled replicas, cross-check against the Replica CRs —
 	// the authoritative store. When a departing node's longhorn-manager dies
@@ -319,6 +373,8 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 					"machine", machine.Name, "node", nodeName, "affectedVolumes", earlyVolumes, "elapsed", elapsed.Truncate(time.Second))
 				r.emitEvent(machine, corev1.EventTypeNormal, "LonghornEarlyRelease",
 					fmt.Sprintf("Longhorn eviction drained node %s; volumes degraded-but-safe (rebuild blocked by departing node membership) — releasing pre-terminate hook early", nodeName))
+				// CRIT-1b: the relocation raise is transient — restore before releasing.
+				r.restoreReplicaWants(ctx, wlClient, machine)
 				if err := r.removeHook(ctx, machine); err != nil {
 					return ctrl.Result{}, err
 				}
@@ -338,6 +394,8 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	l.Info("Longhorn eviction complete — releasing pre-terminate hook", "machine", machine.Name, "node", nodeName)
 	r.emitEvent(machine, corev1.EventTypeNormal, "LonghornEvictionComplete",
 		fmt.Sprintf("Longhorn eviction complete for node %s, releasing pre-terminate hook", nodeName))
+	// CRIT-1b: the relocation raise is transient — restore before releasing.
+	r.restoreReplicaWants(ctx, wlClient, machine)
 	if err := r.removeHook(ctx, machine); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -528,6 +586,237 @@ func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlC
 	}
 	sort.Strings(names)
 	return removed, names, nil
+}
+
+// relocateLastReplicas raises the replica count of every volume whose ONLY
+// data-holding replicas sit on nodes CAPI is deleting, so Longhorn's standard
+// scheduling immediately starts a replacement rebuild on a surviving node.
+// CRIT-1b (UPD-1, 2026-10-01): in the machine-set roll flow the infra VM is
+// deleted hook-blind seconds after the machine deletion starts, and Longhorn
+// eviction only replenishes promptly when the volume is attached to the
+// departing node — in the unattached geometry (volume attached to a surviving
+// node, replica on the departing one) no replacement was ever created and the
+// single-replica volume was lost. A spec.numberOfReplicas raise forces that
+// replacement through the always-on scheduling reconcile. The original count
+// is recorded on the Machine (ReplicaScaleOrigAnnotation) and restored once
+// the doomed replica is gone (restoreReplicaWants). Idempotent: a volume
+// already recorded is never raised again.
+func (r *LonghornEvictionReconciler) relocateLastReplicas(ctx context.Context, wlClient client.Client, machine *clusterv1.Machine, departingNode string, deletingNodes map[string]bool) (bool, error) {
+	replicaList := &longhornv1beta2.ReplicaList{}
+	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
+		return false, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
+	}
+
+	// Same classification as the release gate: a replica counts as surviving
+	// data only when it holds the volume's data (HealthyAt) on a non-deleting
+	// node. Doomed data-holding replicas are what need relocating.
+	liveByVolume := map[string]int{}
+	doomedDataByVolume := map[string]int{}
+	for i := range replicaList.Items {
+		rep := &replicaList.Items[i]
+		volName := volumeNameFromReplica(rep)
+		if volName == "" {
+			continue
+		}
+		nodeID := rep.Spec.NodeID
+		doomed := nodeID == departingNode || deletingNodes[nodeID]
+		if doomed {
+			if replicaHoldsData(*rep) {
+				doomedDataByVolume[volName]++
+			}
+			continue
+		}
+		if replicaHoldsData(*rep) {
+			liveByVolume[volName]++
+		}
+	}
+	if len(doomedDataByVolume) == 0 {
+		return false, nil
+	}
+
+	recorded := map[string]bool{}
+	origAnnotation := machine.Annotations[ReplicaScaleOrigAnnotation]
+	if origAnnotation != "" {
+		for _, ent := range strings.Split(origAnnotation, ",") {
+			kv := strings.SplitN(strings.TrimSpace(ent), "=", 2)
+			if len(kv) == 2 {
+				recorded[kv[0]] = true
+			}
+		}
+	}
+
+	relocated := false
+	vols := make([]string, 0, len(doomedDataByVolume))
+	for v := range doomedDataByVolume {
+		vols = append(vols, v)
+	}
+	sort.Strings(vols)
+	for _, volName := range vols {
+		if liveByVolume[volName] > 0 {
+			continue // a surviving node already holds the volume's data
+		}
+		if recorded[volName] {
+			continue // already raised for this deletion — idempotent
+		}
+		vol := &longhornv1beta2.Volume{}
+		if err := wlClient.Get(ctx, types.NamespacedName{Name: volName, Namespace: r.LonghornNS}, vol); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue // volume gone — nothing to protect
+			}
+			return relocated, fmt.Errorf("getting volume %s: %w", volName, err)
+		}
+		want := vol.Spec.NumberOfReplicas
+		if want <= 0 {
+			want = 1
+		}
+		// Record BEFORE raising: a crash between the two writes leaves a
+		// recorded-but-unapplied entry whose restore is a harmless no-op,
+		// never a double-raise.
+		newEntry := volName + "=" + strconv.Itoa(want)
+		ann := origAnnotation
+		if ann != "" {
+			ann += "," + newEntry
+		} else {
+			ann = newEntry
+		}
+		mpatch := client.MergeFrom(machine.DeepCopy())
+		if machine.Annotations == nil {
+			machine.Annotations = map[string]string{}
+		}
+		machine.Annotations[ReplicaScaleOrigAnnotation] = ann
+		if err := r.Patch(ctx, machine, mpatch); err != nil {
+			return relocated, fmt.Errorf("recording relocation on machine %s: %w", machine.Name, err)
+		}
+		recorded[volName] = true
+		origAnnotation = ann
+
+		vpatch := client.MergeFrom(vol.DeepCopy())
+		raised := want + doomedDataByVolume[volName]
+		vol.Spec.NumberOfReplicas = raised
+		if err := wlClient.Patch(ctx, vol, vpatch); err != nil {
+			return relocated, fmt.Errorf("raising replica count of volume %s: %w", volName, err)
+		}
+		relocated = true
+		r.emitEvent(machine, corev1.EventTypeNormal, "LonghornLastReplicaRelocation",
+			fmt.Sprintf("Volume %s: only data-holding replicas sit on nodes being deleted — raised replica count %d→%d to force immediate rebuild onto surviving nodes (restored on release)", volName, want, raised))
+	}
+	return relocated, nil
+}
+
+// restoreReplicaWants reapplies the original spec.numberOfReplicas of volumes
+// temporarily raised by relocateLastReplicas, recorded on the Machine
+// annotation. Called from every hook-release path (and the post-release
+// lingering path) so the raise is transient. Idempotent: volumes already at
+// (or below) their recorded count are skipped. wlClient may be nil — the
+// helper builds one via r.APIReader when needed.
+func (r *LonghornEvictionReconciler) restoreReplicaWants(ctx context.Context, wlClient client.Client, machine *clusterv1.Machine) {
+	orig := machine.Annotations[ReplicaScaleOrigAnnotation]
+	if orig == "" {
+		return
+	}
+	if wlClient == nil {
+		var err error
+		wlClient, err = buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "restoreReplicaWants: cannot build workload cluster client — will retry on next reconcile", "machine", machine.Name)
+			return
+		}
+	}
+	for _, ent := range strings.Split(orig, ",") {
+		kv := strings.SplitN(strings.TrimSpace(ent), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		volName, wantStr := kv[0], kv[1]
+		want, err := strconv.Atoi(wantStr)
+		if err != nil || want <= 0 {
+			continue
+		}
+		vol := &longhornv1beta2.Volume{}
+		if err := wlClient.Get(ctx, types.NamespacedName{Name: volName, Namespace: r.LonghornNS}, vol); err != nil {
+			continue // volume gone (deleted with its workload) — nothing to restore
+		}
+		if vol.Spec.NumberOfReplicas <= want {
+			continue // already restored
+		}
+		patch := client.MergeFrom(vol.DeepCopy())
+		vol.Spec.NumberOfReplicas = want
+		if err := wlClient.Patch(ctx, vol, patch); err != nil {
+			log.FromContext(ctx).Error(err, "restoreReplicaWants: failed to restore replica count", "machine", machine.Name, "volume", volName, "want", want)
+			continue
+		}
+		log.FromContext(ctx).Info("Restored original replica count after relocation", "machine", machine.Name, "volume", volName, "want", want)
+	}
+}
+
+// healFailedSourceReplicas uncordons a node that still exists in the workload
+// cluster when one of its data-bearing replicas — one the volume still depends
+// on — has FAILED mid-relocation (the drain or teardown killed the instance
+// manager). Longhorn recreates the instance manager once the node is
+// schedulable again and auto-salvage can restart the replica from its intact
+// disk, letting the in-flight rebuild resume before the VM is torn down
+// (observed teardown grace after the deletion signal: ~100s).
+func (r *LonghornEvictionReconciler) healFailedSourceReplicas(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (bool, error) {
+	replicaList := &longhornv1beta2.ReplicaList{}
+	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
+		return false, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
+	}
+	liveByVolume := map[string]int{}
+	failedSourceNode := map[string]string{} // volume -> node of a failed data-bearing doomed replica
+	for i := range replicaList.Items {
+		rep := &replicaList.Items[i]
+		volName := volumeNameFromReplica(rep)
+		if volName == "" {
+			continue
+		}
+		nodeID := rep.Spec.NodeID
+		doomed := nodeID == departingNode || deletingNodes[nodeID]
+		if doomed {
+			// FailedAt is set when a running replica fails; its disk still
+			// holds the volume's data and can be salvaged.
+			if rep.Spec.FailedAt != "" {
+				if _, ok := failedSourceNode[volName]; !ok {
+					failedSourceNode[volName] = nodeID
+				}
+			}
+			continue
+		}
+		if replicaHoldsData(*rep) {
+			liveByVolume[volName]++
+		}
+	}
+	if len(failedSourceNode) == 0 {
+		return false, nil
+	}
+
+	k8sNodes, err := r.k8sNodeNames(ctx, wlClient)
+	if err != nil {
+		return false, fmt.Errorf("listing k8s nodes: %w", err)
+	}
+
+	healed := false
+	for volName, nodeID := range failedSourceNode {
+		if liveByVolume[volName] > 0 {
+			continue // a survivor already holds the data — no urgency
+		}
+		if !k8sNodes[nodeID] {
+			continue // node gone — nothing to salvage
+		}
+		node := &corev1.Node{}
+		if err := wlClient.Get(ctx, types.NamespacedName{Name: nodeID}, node); err != nil {
+			continue // cannot inspect — leave it alone
+		}
+		if !node.Spec.Unschedulable {
+			continue
+		}
+		patch := client.MergeFrom(node.DeepCopy())
+		node.Spec.Unschedulable = false
+		if err := wlClient.Patch(ctx, node, patch); err != nil {
+			return healed, fmt.Errorf("uncordoning node %s: %w", nodeID, err)
+		}
+		healed = true
+	}
+	return healed, nil
 }
 
 // liveNodeNames returns the set of Longhorn node hostnames that are currently

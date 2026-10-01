@@ -29,9 +29,13 @@ rules:
   - apiGroups: ["longhorn.io"]
     resources: ["replicas"]
     verbs: ["get", "list", "watch", "delete"]
+  # CRIT-1b relocation: temporarily RAISE a volume's spec.numberOfReplicas when
+  # its only data-holding replicas sit on a node CAPI is deleting, so Longhorn
+  # schedules the replacement immediately; the original count is restored on
+  # hook release (restoreReplicaWants).
   - apiGroups: ["longhorn.io"]
     resources: ["volumes"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   # EvictStuckPods (post-release attachment cleanup): cordon the departing node
   # and force-delete workload pods holding Longhorn PVCs. Requires Pod list/
   # delete (cluster-wide: pods land in every namespace), PVC lookup (to map a
