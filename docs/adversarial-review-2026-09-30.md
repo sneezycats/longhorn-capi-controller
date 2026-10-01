@@ -45,7 +45,13 @@ Found by executing S2 of the validation plan on lab cluster `lhcc-roll1` (Longho
 
 ---
 
-## ⚠️ Security / published vulnerabilities
+### CRIT-1b. The pre-terminate hook does not gate machine teardown in the roll flow (upgrade-cycle finding, 2026-10-01)
+
+Found executing the real upgrade use case — a rolling OS-image hop of `lhcc-roll1` (6.0→6.1, machine-set-driven machine replacement). For a 1-replica volume whose only data-holding replica sits on the machine being rolled **and whose volume is attached elsewhere** (the common mid-roll case — workload pods move to new nodes as old ones die), the machine drain has no attachment blocker, and the infra VM was deleted ~10–16s after the machine deletion began **while the hook was held and LH's eviction had not yet produced any migration** (no replacement replica CR ever appeared). The drain evicted the node's instance manager (replica `mode ERR`), then the VM deletion destroyed the disk. The controller never deleted anything — its refusals held correctly — but the only copy died with the VM; LH's auto-salvage later looped "Bringing up 0 replicas" (disk gone). Every prior successful hop (manual deletes, and roll hops where the volume was still attached to the departing node) was protected by the volume **attachment** blocking the drain (`WaitingForVolumeDetach`), not by the hook: the hook was observed to gate only late machine-deletion steps (the machine CR lingered in `Deleting` for 25+ min with the hook held, VM already destroyed).
+
+**Not yet fixed — needs design review (maintainer + independent reviewer).** Candidate directions: (a) controller enforces an LH attachment of last-replica volumes onto the departing node until LH's eviction relocates them (deterministically recreating the drain blocker); (b) upstream verification of pre-terminate-hook semantics in Rancher 2.14/CAPRKE2 machine-set deletions; (c) documented operational limit: single-replica SCs are not safe across rolling upgrades. See `docs/validation-results-2026-10-01.md` §Round 3 for the full timeline.
+
+---
 
 ### SEC-1. Reachable CVEs in dependencies (govulncheck, symbol-level)
 
