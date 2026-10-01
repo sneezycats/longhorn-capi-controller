@@ -11,6 +11,8 @@ Provenance note: at review time the GitHub web UI intermittently displayed the r
 
 **Changes Requested.** 2 critical data-loss paths, 3 reachable published vulnerabilities, and several security/convention findings. All proposed fixes are on the branch; none are merged. Tests of the changes are deliberately deferred and are specified separately.
 
+**Update (2026-10-01):** executing the validation plan on lab cluster `lhcc-roll1` found **CRIT-1a** — a data-loss hole in the CRIT-1 fix itself (see below). Fixed on the branch with regression tests; re-validation pending.
+
 ---
 
 ## 🔴 Critical — data-loss paths in replica cleanup
@@ -32,6 +34,12 @@ Same function, main ~:434: `onGoneNode` was true for any node not in `liveNodes`
 `deletingNodeNames` (main ~:385-401) listed **all** Machines in the management cluster. Node names are hostnames and are **not unique across workload clusters**. A Machine being deleted in cluster A marked cluster B's same-named healthy node as doomed → `cleanupBadReplicas` would force-delete its replicas. For a product whose premise is one management cluster watching many workload clusters, this was the sharpest correctness bug in the repo.
 
 **Fix (75d3340):** `deletingNodeNames` is scoped to the Machine's own cluster (same namespace + `spec.clusterName`). Within the cluster it still covers *any* doomed node, not just the reconciled Machine.
+
+### CRIT-1a. The CRIT-1 guard counted unsynced replacement replicas (validation finding, 2026-10-01)
+
+Found by executing S2 of the validation plan on lab cluster `lhcc-roll1` (Longhorn 1.12.1): the last-live-replica guard's survivor count treated **any running replica** as a surviving copy. Longhorn's own eviction replenishment creates a replacement replica within seconds — its process reports `running` immediately, but it holds **no data** until its rebuild completes (169MB in the observed run). One 15s poll later the guard saw "a live copy exists", dropped its refusal, and deleted the migration **source** — the only replica holding data — in the same second the engine began rebuilding from it. The in-flight rebuild died (`connection refused`), the empty replacement was cleaned up, and the single-replica volume ended FAULTED with zero replicas and unrecoverable data about a minute after trigger (nowhere near the 30m backstop; viable rebuild targets existed). The early-release gate (`volumeReplicaState`) shared the same predicate and released the hook as "degraded-but-safe" during the migration; it also had a want=1 degeneracy (`want-1 == 0`) under which a volume with **zero** surviving copies passed as safe.
+
+**Fix:** survivor counting — in both the cleanup guard and the release gate — now requires the replica to actually **hold the volume's data**: `Spec.HealthyAt` set. Per the Longhorn API contract, HealthyAt is cleared before any rebuild and set when the replica goes read/write, so a mid-migration replacement never qualifies and the refusal is sticky until the migration truly completes. The release gate additionally requires `max(want-1, 1)` data-holding replicas, closing the want=1 degeneracy. Regression tests added: refusal while the replacement is mid-rebuild; deletion allowed once the replacement holds data; S1 semantics (multi-replica cleanup proceeds); early-release hold for a want=1 volume mid-migration; refusal when the only survivor on a multi-replica volume is mid-rebuild.
 
 ---
 
@@ -109,7 +117,7 @@ Noted, deliberately left (behavior changes / cosmetic):
 ## Deliberately NOT changed (flagged for maintainer)
 
 1. **`volumeReplicaState` gates on every volume in the Longhorn namespace, not just eviction-affected ones.** The README said "affected volumes"; the code says "all volumes". Docs were corrected instead of the code (af81bbe): narrowing the gate to "has doomed replicas" breaks `--early-release=false` strict mode, because cleanup deletes the doomed Replica CRs first, after which those volumes look unaffected and the gate vacuously passes at want−1. The proper fix is snapshotting the affected set onto the Machine at hook registration — a design change that should not land untested.
-2. **Test coverage gap:** `cleanupBadReplicas` — the most dangerous function in the repo — had zero unit tests before this branch, and none were added (per review ground rules). Recommended tests: last-replica skip, gone-vs-NotReady node classification, per-cluster deleting-node scoping.
+2. **Test coverage gap:** `cleanupBadReplicas` — the most dangerous function in the repo — had zero unit tests before this branch. The CRIT-1a fix (below) adds regression tests for the last-replica refusal paths; gone-vs-NotReady classification and per-cluster deleting-node scoping remain review-only (S3/S4).
 3. **Version skew:** vendored Longhorn types pinned at longhorn-manager v1.8.1 while the README validates against Longhorn 1.12.x. Fine today (v1beta2 is the stable API surface); worth a periodic re-vendor.
 
 ---
@@ -135,6 +143,7 @@ Noted, deliberately left (behavior changes / cosmetic):
 | `e6eef67` | CORR-1, CORR-2 (EvictStuckPods) |
 | `31405e8` | SEC-2, SEC-3, SEC-5, CORR-3, CORR-4, convention fixes |
 | `af81bbe` | SEC-4, build/docs hygiene, README accuracy |
-| (this commit) | review record + test plan |
+| `9104955` | review record + test plan |
+| (this commit) | CRIT-1a: data-holding survivor predicate (`HealthyAt`), want=1 release-gate fix, regression tests |
 
 **Status:** branch pushed, not merged, no PR. Validation of these changes is specified in `docs/test-plan-2026-09-30.md` and must run before merge.

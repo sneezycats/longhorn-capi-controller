@@ -434,8 +434,12 @@ func (r *LonghornEvictionReconciler) deletingNodeNames(ctx context.Context, mach
 // so anything still present in the cluster is left to Longhorn's own eviction.
 //
 // Safety: a replica is never deleted if that would leave its volume with zero
-// running replicas on nodes that are not being deleted — i.e. it is the volume's
-// last live copy. Single-replica volumes are the obvious case (Harvester's
+// running replicas that hold the volume's data (Spec.HealthyAt set) on nodes
+// that are not being deleted — i.e. it is the volume's last live copy. A
+// running-but-never-synced replacement replica (created by the eviction
+// replenishment mid-migration) does NOT count as a surviving copy: Longhorn
+// clears HealthyAt before a rebuild and sets it only once the replica goes
+// read/write. Single-replica volumes are the obvious case (Harvester's
 // default storage class is one): Longhorn's own eviction migrates such a
 // replica safely given time, while deleting it destroys the data. Volumes whose
 // Volume CR no longer exists are garbage and exempt from this protection.
@@ -461,8 +465,16 @@ func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlC
 		return nil, nil, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
 	}
 
-	// Pass 1: classify deletion candidates and count the running replicas each
-	// volume keeps on nodes that are not being deleted (the surviving data).
+	// Pass 1: classify deletion candidates and count the replicas each volume
+	// keeps on nodes that are not being deleted (the surviving data). A replica
+	// only counts as surviving data when it actually HOLDS the volume's data:
+	// Longhorn clears Spec.HealthyAt before any rebuild and sets it when the
+	// replica goes read/write, so a replacement replica created seconds ago by
+	// the eviction's own replenishment is running but holds nothing (HealthyAt
+	// empty) until its rebuild completes. Counting mere process-liveness made
+	// the guard below drop its refusal one poll after Longhorn started a
+	// migration, and the source replica — the only copy holding data — was
+	// deleted mid-rebuild (CRIT-1a, observed 2026-10-01 on lhcc-roll1 S2).
 	type candidate struct {
 		rep  *longhornv1beta2.Replica
 		doom bool
@@ -481,7 +493,7 @@ func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlC
 			candidates = append(candidates, candidate{rep: rep, doom: doom})
 			continue
 		}
-		if isReplicaRunning(*rep) {
+		if replicaHoldsData(*rep) {
 			liveByVolume[volName]++
 		}
 	}
@@ -497,7 +509,7 @@ func (r *LonghornEvictionReconciler) cleanupBadReplicas(ctx context.Context, wlC
 				return nil, nil, fmt.Errorf("getting volume %s: %w", volName, volErr)
 			}
 			if volErr == nil && liveByVolume[volName] == 0 {
-				l.Info("Refusing to delete a volume's last live replica — leaving it for Longhorn's own eviction/rebuild",
+				l.Info("Refusing to delete a volume's last live replica — no surviving replica holds the volume's data (HealthyAt); leaving it for Longhorn's own eviction/rebuild",
 					"replica", rep.Name, "node", rep.Spec.NodeID, "volume", volName)
 				continue
 			}
@@ -586,7 +598,9 @@ func (r *LonghornEvictionReconciler) volumesRebuilt(ctx context.Context, wlClien
 // disks are unavailable"), so holding the hook just burns the eviction timeout
 // (E10). Releasing early lets CAPI delete the machine → the GC removes the
 // stale Longhorn Node CR → Longhorn schedules the rebuild on the replacement.
-// A faulted volume or a replica deficit beyond want-1 still holds the hook.
+// A faulted volume, a replica deficit beyond max(want-1, 1) data-holding
+// replicas, or a want=1 volume without its one data-holding replica still
+// holds the hook.
 func (r *LonghornEvictionReconciler) earlyReleaseSafe(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (bool, []string, error) {
 	names, allComplete, degradedSafe, err := r.volumeReplicaState(ctx, wlClient, departingNode, deletingNodes)
 	if err != nil || allComplete {
@@ -597,8 +611,11 @@ func (r *LonghornEvictionReconciler) earlyReleaseSafe(ctx context.Context, wlCli
 
 // volumeReplicaState returns the sorted affected-volume names, whether ALL
 // affected volumes already meet their full replica count on live nodes
-// (allComplete), and whether they are all degraded-but-safe (>= want-1 live
-// replicas each and none faulted — degradedSafe). Faulted forces degradedSafe=false.
+// (allComplete), and whether they are all degraded-but-safe (>= max(want-1, 1)
+// data-holding replicas each and none faulted — degradedSafe). Only replicas
+// that hold the volume's data count (replicaHoldsData): a running replacement
+// replica that has not finished its rebuild does not. Faulted forces
+// degradedSafe=false.
 func (r *LonghornEvictionReconciler) volumeReplicaState(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (names []string, allComplete bool, degradedSafe bool, err error) {
 	replicaList := &longhornv1beta2.ReplicaList{}
 	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
@@ -615,7 +632,10 @@ func (r *LonghornEvictionReconciler) volumeReplicaState(ctx context.Context, wlC
 			continue
 		}
 		affectedVolumes[volName] = true
-		if doomed || !isReplicaRunning(rep) {
+		// Same data-holding rule as cleanupBadReplicas: a running replica that
+		// has not completed a rebuild yet (HealthyAt empty) is not a copy the
+		// volume can afford to rely on.
+		if doomed || !replicaHoldsData(rep) {
 			continue
 		}
 		liveByVolume[volName]++
@@ -644,7 +664,16 @@ func (r *LonghornEvictionReconciler) volumeReplicaState(ctx context.Context, wlC
 		if liveByVolume[volName] < want {
 			allComplete = false
 		}
-		if liveByVolume[volName] < want-1 {
+		// Degraded-but-safe needs max(want-1, 1) data-holding replicas. For a
+		// want=1 volume, want-1 is 0 and "zero surviving copies" must never
+		// count as safe — CRIT-1a: the 2026-10-01 S2 release fired on exactly
+		// this degeneracy while the volume's only copy was an unsynced
+		// replacement replica.
+		minSurviving := want - 1
+		if minSurviving < 1 {
+			minSurviving = 1
+		}
+		if liveByVolume[volName] < minSurviving {
 			degradedSafe = false
 		}
 		if vol.Status.Robustness == longhornv1beta2.VolumeRobustnessFaulted {
@@ -676,6 +705,17 @@ func isReplicaRunning(rep longhornv1beta2.Replica) bool {
 	st := rep.Status.InstanceStatus
 	// currentState values: running, stopped, error, starting, stopping.
 	return st.CurrentState == "running" && rep.Spec.FailedAt == ""
+}
+
+// replicaHoldsData reports whether a replica is usable AND currently holds the
+// volume's data. Longhorn clears Spec.HealthyAt before a rebuild and sets it
+// when the replica goes read/write, so a replacement replica created by the
+// eviction's replenishment is running but holds nothing until its rebuild
+// completes. "A running process" is not "a surviving copy" — counting unsynced
+// replicas as live data destroyed a single-replica volume mid-migration
+// (CRIT-1a, 2026-10-01).
+func replicaHoldsData(rep longhornv1beta2.Replica) bool {
+	return isReplicaRunning(rep) && rep.Spec.HealthyAt != ""
 }
 
 // removeHook removes the pre-terminate hook annotation from the Machine CR via PATCH.

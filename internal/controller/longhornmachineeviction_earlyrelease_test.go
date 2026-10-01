@@ -35,10 +35,14 @@ func mkVolume(name string, want int, robustness string) *longhornv1beta2.Volume 
 func mkReplica(vol, node, state, failedAt string) *longhornv1beta2.Replica {
 	return &longhornv1beta2.Replica{
 		ObjectMeta: metav1.ObjectMeta{Name: vol + "-r-" + node, Namespace: "longhorn-system"},
+		// HealthyAt set by default: mkReplica models a serving replica that
+		// holds its volume's data. Tests needing a not-yet-synced replica
+		// (mid-rebuild) clear it explicitly.
 		Spec: longhornv1beta2.ReplicaSpec{
 			NodeID:     node,
 			EngineName: vol + "-e-0",
 			FailedAt:   failedAt,
+			HealthyAt:  "2026-09-30T00:00:00Z",
 		},
 		Status: longhornv1beta2.ReplicaStatus{
 			InstanceStatus: longhornv1beta2.InstanceStatus{CurrentState: longhornv1beta2.InstanceState(state)},
