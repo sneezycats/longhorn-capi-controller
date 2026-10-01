@@ -27,7 +27,7 @@ import (
 // patch writes a Machine annotation through the same client).
 func evRelocateScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
-	s := evRelocateScheme(t)
+	s := evScheme(t)
 	if err := clusterv1.AddToScheme(s); err != nil {
 		t.Fatal(err)
 	}
