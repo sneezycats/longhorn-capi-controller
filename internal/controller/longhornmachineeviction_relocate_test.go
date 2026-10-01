@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clusterv1 "sigs.k8s.io/cluster-api/api/v1beta1"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -20,6 +21,14 @@ import (
 // source replica failed anyway (salvage from the intact disk), and restore the
 // original count on release.
 
+// mkDelMachine: mkMachine with a finalizer so the fake client accepts a
+// machine carrying a deletionTimestamp (refused otherwise).
+func mkDelMachine(nodeName string) *clusterv1.Machine {
+	m := mkMachine(nodeName)
+	m.Finalizers = append(m.Finalizers, "cluster.x-k8s.io/machine")
+	return m
+}
+
 // TestRelocateRaisesWantForLastReplicaVolume: a want=1 volume whose only
 // data-holding replica sits on the departing node gets its replica count
 // raised (1→2) and the original recorded on the Machine annotation.
@@ -27,7 +36,7 @@ func TestRelocateRaisesWantForLastReplicaVolume(t *testing.T) {
 	s := evScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "")
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(vol, src, machine).Build()
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system", APIReader: c}
@@ -56,7 +65,7 @@ func TestRelocateSkipsWhenSurvivorHoldsData(t *testing.T) {
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "")
 	survivor := mkReplica("pvc-x", "node-alive", "running", "")
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(vol, src, survivor, machine).Build()
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system", APIReader: c}
@@ -82,7 +91,7 @@ func TestRelocateIdempotentViaAnnotation(t *testing.T) {
 	s := evScheme(t)
 	vol := mkVolume("pvc-x", 1, "degraded")
 	src := mkReplica("pvc-x", "node-departing", "running", "")
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(vol, src, machine).Build()
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system", APIReader: c}
@@ -110,7 +119,7 @@ func TestRelocateNoOpWhenDoomedReplicaHoldsNoData(t *testing.T) {
 	vol := mkVolume("pvc-x", 1, "degraded")
 	garbage := mkReplica("pvc-x", "node-departing", "stopped", "")
 	garbage.Spec.HealthyAt = ""
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(vol, garbage, machine).Build()
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system", APIReader: c}
@@ -132,7 +141,7 @@ func TestRelocateNoOpWhenDoomedReplicaHoldsNoData(t *testing.T) {
 func TestRelocateSkipsWhenVolumeGone(t *testing.T) {
 	s := evScheme(t)
 	src := mkReplica("pvc-gone", "node-departing", "running", "")
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(src, machine).Build()
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system", APIReader: c}
@@ -150,7 +159,7 @@ func TestRelocateSkipsWhenVolumeGone(t *testing.T) {
 func TestRestoreReplicaWantsRestoresCount(t *testing.T) {
 	s := evScheme(t)
 	vol := mkVolume("pvc-x", 2, "healthy")
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 	machine.Annotations[ReplicaScaleOrigAnnotation] = "pvc-x=1"
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(vol, machine).Build()
@@ -166,7 +175,7 @@ func TestRestoreReplicaWantsRestoresCount(t *testing.T) {
 func TestRestoreSkipsWhenAlreadyAtOriginal(t *testing.T) {
 	s := evScheme(t)
 	vol := mkVolume("pvc-x", 1, "healthy")
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 	machine.Annotations[ReplicaScaleOrigAnnotation] = "pvc-x=1"
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(vol, machine).Build()
@@ -183,7 +192,7 @@ func TestRestoreSkipsWhenAlreadyAtOriginal(t *testing.T) {
 func TestRestoreNoopWithoutAnnotation(t *testing.T) {
 	s := evScheme(t)
 	vol := mkVolume("pvc-x", 5, "healthy")
-	machine := mkMachine("node-departing")
+	machine := mkDelMachine("node-departing")
 
 	c := fake.NewClientBuilder().WithScheme(s).WithObjects(vol, machine).Build()
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system", APIReader: c}
