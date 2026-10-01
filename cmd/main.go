@@ -84,6 +84,7 @@ func main() {
 
 	if err := (&controller.LonghornEvictionReconciler{
 		Client:          mgr.GetClient(),
+		APIReader:       mgr.GetAPIReader(),
 		Scheme:          mgr.GetScheme(),
 		Recorder:        mgr.GetEventRecorderFor("longhorn-capi-eviction-controller"),
 		EvictionTimeout: evictionTimeout,
@@ -98,6 +99,7 @@ func main() {
 
 	if err := (&controller.LonghornNodeGCReconciler{
 		Client:     mgr.GetClient(),
+		APIReader:  mgr.GetAPIReader(),
 		Scheme:     mgr.GetScheme(),
 		Recorder:   mgr.GetEventRecorderFor("longhorn-capi-eviction-controller"),
 		GCInterval: gcInterval,

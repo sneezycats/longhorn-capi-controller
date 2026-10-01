@@ -9,7 +9,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -40,11 +39,17 @@ const HookReleasedAnnotation = "longhorn-capi.io/hook-released"
 // LonghornEvictionReconciler reconciles CAPI Machine objects to ensure
 // Longhorn replicas are fully evicted before the Machine is terminated.
 //
-// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;list;watch;patch;update
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machines,verbs=get;list;watch;patch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 type LonghornEvictionReconciler struct {
 	client.Client
+	// APIReader is the manager's uncached reader, used exclusively to read
+	// workload kubeconfig Secrets. Routing Secret reads through the cached
+	// client would lazily start a Secret informer that lists and caches every
+	// Secret in the management cluster — widening the required RBAC to
+	// list/watch and keeping all workload admin credentials in memory.
+	APIReader       client.Reader
 	Scheme          *runtime.Scheme
 	Recorder        record.EventRecorder
 	EvictionTimeout time.Duration
@@ -125,7 +130,7 @@ func (r *LonghornEvictionReconciler) handleDeletionDetected(ctx context.Context,
 		if r.EvictStuckPods {
 			// Build the workload client here; the release path may run long
 			// after the hook reconciliation that had one.
-			if wlClient, err := buildWorkloadClusterClient(ctx, r.Client, machine.Spec.ClusterName, machine.Namespace); err == nil {
+			if wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace); err == nil {
 				r.releaseStuckAttachments(ctx, wlClient, machine)
 			} else {
 				log.FromContext(ctx).V(1).Info("EvictStuckPods: no workload client yet", "machine", machine.Name, "err", err.Error())
@@ -198,7 +203,7 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	}
 
 	// 3. Build workload cluster client.
-	wlClient, err := buildWorkloadClusterClient(ctx, r.Client, clusterName, machine.Namespace)
+	wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, clusterName, machine.Namespace)
 	if err != nil {
 		l.Error(err, "Failed to build workload cluster client — requeueing", "machine", machine.Name, "cluster", clusterName)
 		// Do NOT release hook — wait for connectivity, up to timeout.
@@ -277,7 +282,7 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	// the hook until timeout. If no live replica CR remains on the node,
 	// eviction IS complete regardless of the frozen status.
 	if !isEvictionComplete(lhNode) {
-		replicasDrained, err := r.nodeReplicasDrained(ctx, wlClient, nodeName, delNodes)
+		replicasDrained, err := r.nodeReplicasDrained(ctx, wlClient, nodeName)
 		if err != nil {
 			l.Error(err, "Failed to cross-check replica drain state — requeueing", "machine", machine.Name, "node", nodeName)
 			return ctrl.Result{RequeueAfter: r.PollInterval}, nil
@@ -340,9 +345,13 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 }
 
 // isEvictionComplete returns true when all disks have zero scheduled replicas and backing images.
+// A nil or empty DiskStatus map means the node has never reported (fresh CR,
+// or its longhorn-manager died before reporting anything) — that is UNKNOWN,
+// not complete: return false so the Replica-CR cross-check in the reconcile
+// path decides instead.
 func isEvictionComplete(node *longhornv1beta2.Node) bool {
 	if node.Status.DiskStatus == nil || len(node.Status.DiskStatus) == 0 {
-		return true
+		return false
 	}
 	for _, ds := range node.Status.DiskStatus {
 		if ds == nil {
@@ -359,7 +368,7 @@ func isEvictionComplete(node *longhornv1beta2.Node) bool {
 // the Replica CRs (authoritative). Returns true when the node hosts no RUNNING
 // replica of any live volume — i.e. the eviction's actual work is done even if
 // the dead node's status map still lists stale scheduledReplica entries.
-func (r *LonghornEvictionReconciler) nodeReplicasDrained(ctx context.Context, wlClient client.Client, departingNode string, deletingNodes map[string]bool) (bool, error) {
+func (r *LonghornEvictionReconciler) nodeReplicasDrained(ctx context.Context, wlClient client.Client, departingNode string) (bool, error) {
 	replicaList := &longhornv1beta2.ReplicaList{}
 	if err := wlClient.List(ctx, replicaList, client.InNamespace(r.LonghornNS)); err != nil {
 		return false, fmt.Errorf("listing replicas in %s: %w", r.LonghornNS, err)
@@ -903,12 +912,17 @@ var workloadScheme = func() *runtime.Scheme {
 	return s
 }()
 
-// buildWorkloadClusterClient constructs a controller-runtime client for the workload cluster
-// identified by clusterName/namespace by reading the <clusterName>-kubeconfig Secret.
-func buildWorkloadClusterClient(ctx context.Context, mgmtClient client.Client, clusterName, namespace string) (client.Client, error) {
+// buildWorkloadClusterClient constructs a controller-runtime client for the
+// workload cluster identified by clusterName/namespace by reading the
+// <clusterName>-kubeconfig Secret through an UNCACHED reader. Passing the
+// manager's cached client here would lazily create a Secret informer that
+// lists and watches every Secret in the management cluster — widening the RBAC
+// surface and keeping every workload cluster's admin credential resident in
+// controller memory.
+func buildWorkloadClusterClient(ctx context.Context, secretReader client.Reader, clusterName, namespace string) (client.Client, error) {
 	secretName := clusterName + "-kubeconfig"
 	secret := &corev1.Secret{}
-	if err := mgmtClient.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
+	if err := secretReader.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
 		return nil, fmt.Errorf("fetching kubeconfig secret %s/%s: %w", namespace, secretName, err)
 	}
 	kubeconfigBytes, ok := secret.Data["value"]
@@ -931,6 +945,3 @@ func (r *LonghornEvictionReconciler) emitEvent(obj runtime.Object, eventType, re
 		r.Recorder.Eventf(obj, eventType, reason, "%s", message)
 	}
 }
-
-// Ensure metatime import is retained for go mod tidy.
-var _ = metav1.Now

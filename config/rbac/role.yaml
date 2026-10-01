@@ -12,13 +12,11 @@ rules:
     resources: ["clusters"]
     verbs: ["get", "list"]
 
-  # CAPI Machine CRs — core lifecycle.
+  # CAPI Machine CRs — core lifecycle (patch adds/removes the pre-terminate
+  # hook annotation; the controller never writes Machine status).
   - apiGroups: ["cluster.x-k8s.io"]
     resources: ["machines"]
-    verbs: ["get", "list", "watch", "patch", "update"]
-  - apiGroups: ["cluster.x-k8s.io"]
-    resources: ["machines/status"]
-    verbs: ["get"]
+    verbs: ["get", "list", "watch", "patch"]
 
   # Node GC: enumerate CAPI Clusters to find workload clusters to sweep.
   - apiGroups: ["cluster.x-k8s.io"]
@@ -26,9 +24,12 @@ rules:
     verbs: ["get", "list", "watch"]
 
   # Kubeconfig Secrets — one per workload cluster, named <cluster>-kubeconfig.
+  # Read directly from the API with get only: the controller never enumerates
+  # Secrets, so list/watch would be pure blast radius (the kubeconfigs inside
+  # are workload-cluster admin credentials).
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get"]
 
   # Events emitted on Machine CRs (timeout / completion).
   - apiGroups: [""]

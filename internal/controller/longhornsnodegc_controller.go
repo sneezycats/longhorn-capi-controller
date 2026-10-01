@@ -46,6 +46,9 @@ const LonghornFinalizer = "longhorn.io"
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters,verbs=get;list;watch
 type LonghornNodeGCReconciler struct {
 	client.Client
+	// APIReader is the manager's uncached reader, used for kubeconfig
+	// Secret reads (see buildWorkloadClusterClient).
+	APIReader  client.Reader
 	Scheme     *runtime.Scheme
 	Recorder   record.EventRecorder
 	GCInterval time.Duration
@@ -77,7 +80,9 @@ func (r *LonghornNodeGCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			case <-ctx.Done():
 				return nil
 			case <-t.C:
-				_, _ = r.Reconcile(ctx, ctrl.Request{})
+				if _, err := r.Reconcile(ctx, ctrl.Request{}); err != nil {
+					log.FromContext(ctx).WithValues("gc", "longhorn-node").Error(err, "periodic GC pass failed")
+				}
 			}
 		}
 	}))
@@ -104,6 +109,12 @@ func (r *LonghornNodeGCReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		removed, err := r.gcOrphanedNodes(ctx, wlClient)
 		if err != nil {
 			logger.Error(err, "GC pass failed", "cluster", key)
+			// A rejected credential (kubeconfig rotation, token expiry) must
+			// not poison the client cache forever — drop it so the next pass
+			// re-reads the Secret and rebuilds.
+			if apierrors.IsUnauthorized(err) || apierrors.IsForbidden(err) {
+				r.forgetClient(key)
+			}
 			continue
 		}
 		if len(removed) > 0 {
@@ -121,12 +132,20 @@ func (r *LonghornNodeGCReconciler) workloadClient(ctx context.Context, key, clus
 	if c, ok := r.workloadClients[key]; ok {
 		return c, nil
 	}
-	c, err := buildWorkloadClusterClient(ctx, r.Client, clusterName, namespace)
+	c, err := buildWorkloadClusterClient(ctx, r.APIReader, clusterName, namespace)
 	if err != nil {
 		return nil, err
 	}
 	r.workloadClients[key] = c
 	return c, nil
+}
+
+// forgetClient drops the cached workload client for a cluster so the next
+// pass re-reads the kubeconfig Secret and builds a fresh one.
+func (r *LonghornNodeGCReconciler) forgetClient(key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.workloadClients, key)
 }
 
 // gcOrphanedNodes removes Longhorn Node CRs whose k8s Node is gone.
