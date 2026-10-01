@@ -715,9 +715,12 @@ func (r *LonghornEvictionReconciler) removeHook(ctx context.Context, machine *cl
 // releaseStuckAttachments unblocks CAPI's WaitingForVolumeDetach stage after
 // the hook has been released: it cordons the departing node and force-deletes
 // non-DaemonSet pods that (a) are Running on the departing node, (b) consume a
-// Longhorn PVC, and (c) whose volume is NOT faulted (replicas healthy on
-// surviving nodes). The pod reschedules to a live node and the volume detaches.
-// DaemonSet pods are never touched (they belong on every node by design).
+// PVC that positively resolves to a Longhorn Volume CR (not merely "any PVC"),
+// and (c) whose Longhorn volume is NOT faulted (replicas healthy on surviving
+// nodes). The pod reschedules to a live node and the volume detaches.
+// DaemonSet pods are never touched (they belong on every node by design), and
+// a pod whose volume state cannot be verified (lookup error) is skipped:
+// never force-delete on unverified state.
 func (r *LonghornEvictionReconciler) releaseStuckAttachments(ctx context.Context, wlClient client.Client, machine *clusterv1.Machine) {
 	l := log.FromContext(ctx)
 	nodeName := ""
@@ -734,7 +737,9 @@ func (r *LonghornEvictionReconciler) releaseStuckAttachments(ctx context.Context
 		if !k8sNode.Spec.Unschedulable {
 			patch := client.MergeFrom(k8sNode.DeepCopy())
 			k8sNode.Spec.Unschedulable = true
-			if err := wlClient.Patch(ctx, k8sNode, patch); err == nil {
+			if err := wlClient.Patch(ctx, k8sNode, patch); err != nil {
+				l.Error(err, "EvictStuckPods: failed to cordon departing node", "node", nodeName)
+			} else {
 				l.Info("EvictStuckPods: cordoned departing node", "node", nodeName)
 			}
 		}
@@ -764,14 +769,20 @@ func (r *LonghornEvictionReconciler) releaseStuckAttachments(ctx context.Context
 		if isDaemonSetPod(pod) {
 			continue
 		}
-		if !podHasLonghornPVC(pod) {
+		if !podHasAnyPVC(pod) {
 			continue
 		}
-		// Safety: skip if any of the pod's Longhorn volumes is faulted.
-		faulted, err := r.podVolumesFaulted(ctx, wlClient, pod)
+		// Only Longhorn-backed pods are ours to evict: this feature exists to
+		// release Longhorn attachments, and force-deleting unrelated
+		// workloads is out of scope. Skip if any Longhorn volume is faulted,
+		// and skip on lookup errors — never evict on unverified state.
+		hasLonghorn, faulted, err := r.podLonghornVolumeState(ctx, wlClient, pod)
 		if err != nil {
-			l.Error(err, "EvictStuckPods: failed to evaluate pod volumes — skipping pod",
+			l.Error(err, "EvictStuckPods: cannot verify pod volumes — skipping pod",
 				"pod", pod.Name, "namespace", pod.Namespace)
+			continue
+		}
+		if !hasLonghorn {
 			continue
 		}
 		if faulted {
@@ -779,7 +790,10 @@ func (r *LonghornEvictionReconciler) releaseStuckAttachments(ctx context.Context
 				"pod", pod.Name, "namespace", pod.Namespace, "node", nodeName)
 			continue
 		}
-		if err := wlClient.Delete(ctx, pod); err != nil && !apierrors.IsNotFound(err) {
+		// Grace period 0 = actual force-delete. A plain Delete on a node whose
+		// kubelet is gone leaves the pod Terminating forever — the exact stuck
+		// state this is meant to clear.
+		if err := wlClient.Delete(ctx, pod, client.GracePeriodSeconds(0)); err != nil && !apierrors.IsNotFound(err) {
 			l.Error(err, "EvictStuckPods: failed to delete pod", "pod", pod.Name, "namespace", pod.Namespace)
 			continue
 		}
@@ -834,9 +848,10 @@ func isDaemonSetPod(pod *corev1.Pod) bool {
 	return false
 }
 
-// podHasLonghornPVC reports whether any volume in the pod references a PVC.
-// (Provisioner confirmation happens in podVolumesFaulted via the Volume CRs.)
-func podHasLonghornPVC(pod *corev1.Pod) bool {
+// podHasAnyPVC reports whether any volume in the pod references a PVC. This
+// is only a cheap pre-filter; whether the claim is Longhorn-backed is
+// confirmed positively by podLonghornVolumeState.
+func podHasAnyPVC(pod *corev1.Pod) bool {
 	for _, v := range pod.Spec.Volumes {
 		if v.PersistentVolumeClaim != nil {
 			return true
@@ -845,29 +860,39 @@ func podHasLonghornPVC(pod *corev1.Pod) bool {
 	return false
 }
 
-// podVolumesFaulted reports whether any Longhorn-backed volume of the pod is
-// currently faulted. Volumes not provisioned by Longhorn are ignored.
-func (r *LonghornEvictionReconciler) podVolumesFaulted(ctx context.Context, wlClient client.Client, pod *corev1.Pod) (bool, error) {
+// podLonghornVolumeState reports whether the pod consumes at least one
+// Longhorn volume, and whether any of those volumes is currently faulted.
+// Claims that do not resolve to a Longhorn Volume CR do not count as
+// Longhorn. Transient lookup errors are returned as errors so the caller
+// skips the pod instead of evicting on unverified volume state.
+func (r *LonghornEvictionReconciler) podLonghornVolumeState(ctx context.Context, wlClient client.Client, pod *corev1.Pod) (hasLonghorn, faulted bool, err error) {
 	for _, v := range pod.Spec.Volumes {
 		if v.PersistentVolumeClaim == nil {
 			continue
 		}
 		pvc := &corev1.PersistentVolumeClaim{}
 		if err := wlClient.Get(ctx, types.NamespacedName{Name: v.PersistentVolumeClaim.ClaimName, Namespace: pod.Namespace}, pvc); err != nil {
-			continue // cannot resolve — treat as not-faulted (best effort)
+			if apierrors.IsNotFound(err) {
+				continue // PVC gone — no attachment to release
+			}
+			return false, false, fmt.Errorf("getting PVC %s/%s: %w", pod.Namespace, v.PersistentVolumeClaim.ClaimName, err)
 		}
 		if pvc.Spec.VolumeName == "" {
-			continue
+			continue // not bound — no attachment to release
 		}
 		vol := &longhornv1beta2.Volume{}
 		if err := wlClient.Get(ctx, types.NamespacedName{Name: pvc.Spec.VolumeName, Namespace: r.LonghornNS}, vol); err != nil {
-			continue // not a Longhorn volume (or gone) — ignore
+			if apierrors.IsNotFound(err) {
+				continue // not a Longhorn volume
+			}
+			return false, false, fmt.Errorf("getting Longhorn volume %s: %w", pvc.Spec.VolumeName, err)
 		}
+		hasLonghorn = true
 		if vol.Status.Robustness == longhornv1beta2.VolumeRobustnessFaulted {
-			return true, nil
+			faulted = true
 		}
 	}
-	return false, nil
+	return hasLonghorn, faulted, nil
 }
 
 // workloadScheme is a package-level scheme for workload cluster clients.

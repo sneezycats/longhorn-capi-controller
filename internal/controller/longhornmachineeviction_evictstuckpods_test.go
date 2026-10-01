@@ -144,10 +144,10 @@ func TestEvictStuckPodSkipsDaemonSets(t *testing.T) {
 	}
 }
 
-// A pod with a non-Longhorn PVC (volume CR not found) is not blocked, but also
-// is best-effort: the deletion is allowed (the volume doesn't block detach),
-// but must not error.
-func TestEvictStuckPodNonLonghornPVC(t *testing.T) {
+// A pod whose PVC is not backed by Longhorn (no Volume CR resolves) must NOT
+// be deleted: EvictStuckPods clears Longhorn attachments only — force-deleting
+// unrelated workloads is out of scope (per the flag and README documentation).
+func TestEvictStuckPodSkipsNonLonghornPVC(t *testing.T) {
 	s := evScheme(t)
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "departing"}}
 	pod := mkPod("local-pv-app", "default", "departing", "", true)
@@ -157,5 +157,9 @@ func TestEvictStuckPodNonLonghornPVC(t *testing.T) {
 	r := &LonghornEvictionReconciler{Client: c, LonghornNS: "longhorn-system"}
 
 	r.releaseStuckAttachments(context.Background(), c, mkMachine("departing"))
-	// No assertion on deletion; just must not panic/error.
+
+	var got corev1.Pod
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "local-pv-app", Namespace: "default"}, &got); err != nil {
+		t.Fatal("non-Longhorn PVC pod must not be deleted")
+	}
 }
