@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -237,7 +238,11 @@ func TestHealUncordonsFailedSourceNode(t *testing.T) {
 	if !healed {
 		t.Fatal("expected the node to be uncordoned")
 	}
-	if node.Spec.Unschedulable {
+	var nodeAfter corev1.Node
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "node-departing"}, &nodeAfter); err != nil {
+		t.Fatal(err)
+	}
+	if nodeAfter.Spec.Unschedulable {
 		t.Fatal("expected node uncordoned after heal")
 	}
 }
@@ -262,7 +267,11 @@ func TestHealSkipsWhenSurvivorHoldsData(t *testing.T) {
 	if healed {
 		t.Fatal("expected no heal when a survivor holds the data")
 	}
-	if !node.Spec.Unschedulable {
+	var nodeAfter corev1.Node
+	if err := c.Get(context.Background(), types.NamespacedName{Name: "node-departing"}, &nodeAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !nodeAfter.Spec.Unschedulable {
 		t.Fatal("expected node to stay cordoned")
 	}
 }
