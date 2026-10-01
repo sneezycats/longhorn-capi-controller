@@ -11,7 +11,7 @@ Provenance note: at review time the GitHub web UI intermittently displayed the r
 
 **Changes Requested.** 2 critical data-loss paths, 3 reachable published vulnerabilities, and several security/convention findings. All proposed fixes are on the branch; none are merged. Tests of the changes are deliberately deferred and are specified separately.
 
-**Update (2026-10-01):** executing the validation plan on lab cluster `lhcc-roll1` found **CRIT-1a** — a data-loss hole in the CRIT-1 fix itself (see below). Fixed on the branch with regression tests; re-validation pending.
+**Update (2026-10-01):** executing the validation plan on lab cluster `lhcc-roll1` found **CRIT-1a** — a data-loss hole in the CRIT-1 fix itself (see below). Fixed on the branch with regression tests; **revalidated 2026-10-01 — S1/S2/S5–S8 PASS, zero timeout events** (runbook: lab-docs `docs/longhorn/lhcc-review-branch-validation-runbook.md` §Retest round).
 
 ---
 
