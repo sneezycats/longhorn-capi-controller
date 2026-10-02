@@ -65,6 +65,11 @@ type LonghornEvictionReconciler struct {
 	EvictionTimeout time.Duration
 	PollInterval    time.Duration
 	LonghornNS      string
+	// KubeconfigSecretSuffix selects the dedicated per-cluster least-privilege
+	// kubeconfig Secret (<cluster>-<suffix>-kubeconfig) with the shared
+	// <cluster>-kubeconfig Secret as fallback; empty disables the dedicated
+	// lookup. See kubeconfig.go.
+	KubeconfigSecretSuffix string
 	// EarlyRelease: when eviction has drained but the rebuild is blocked only
 	// by the departing node's membership, release the hook early provided all
 	// affected volumes are degraded-but-safe (>= want-1 running replicas, none
@@ -140,7 +145,7 @@ func (r *LonghornEvictionReconciler) handleDeletionDetected(ctx context.Context,
 		// CRIT-1b: restore any temporarily-raised replica counts before
 		// whatever remains of this deletion proceeds — the raise is transient
 		// and must not outlive the migration.
-		if wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace); err == nil {
+		if wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace, r.KubeconfigSecretSuffix); err == nil {
 			r.restoreReplicaWants(ctx, wlClient, machine)
 			if r.EvictStuckPods {
 				r.releaseStuckAttachments(ctx, wlClient, machine)
@@ -219,7 +224,7 @@ func (r *LonghornEvictionReconciler) handleHookRegistered(ctx context.Context, m
 	}
 
 	// 3. Build workload cluster client.
-	wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, clusterName, machine.Namespace)
+	wlClient, err := buildWorkloadClusterClient(ctx, r.APIReader, clusterName, machine.Namespace, r.KubeconfigSecretSuffix)
 	if err != nil {
 		l.Error(err, "Failed to build workload cluster client — requeueing", "machine", machine.Name, "cluster", clusterName)
 		// Do NOT release hook — wait for connectivity, up to timeout.
@@ -716,7 +721,7 @@ func (r *LonghornEvictionReconciler) restoreReplicaWants(ctx context.Context, wl
 	}
 	if wlClient == nil {
 		var err error
-		wlClient, err = buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace)
+		wlClient, err = buildWorkloadClusterClient(ctx, r.APIReader, machine.Spec.ClusterName, machine.Namespace, r.KubeconfigSecretSuffix)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "restoreReplicaWants: cannot build workload cluster client — will retry on next reconcile", "machine", machine.Name)
 			return
@@ -1242,22 +1247,19 @@ var workloadScheme = func() *runtime.Scheme {
 }()
 
 // buildWorkloadClusterClient constructs a controller-runtime client for the
-// workload cluster identified by clusterName/namespace by reading the
-// <clusterName>-kubeconfig Secret through an UNCACHED reader. Passing the
+// workload cluster identified by clusterName/namespace by reading its
+// kubeconfig Secret (dedicated least-privilege Secret first, shared fallback)
+// through an UNCACHED reader. Passing the
 // manager's cached client here would lazily create a Secret informer that
 // lists and watches every Secret in the management cluster — widening the RBAC
 // surface and keeping every workload cluster's admin credential resident in
 // controller memory.
-func buildWorkloadClusterClient(ctx context.Context, secretReader client.Reader, clusterName, namespace string) (client.Client, error) {
-	secretName := clusterName + "-kubeconfig"
-	secret := &corev1.Secret{}
-	if err := secretReader.Get(ctx, types.NamespacedName{Name: secretName, Namespace: namespace}, secret); err != nil {
-		return nil, fmt.Errorf("fetching kubeconfig secret %s/%s: %w", namespace, secretName, err)
+func buildWorkloadClusterClient(ctx context.Context, secretReader client.Reader, clusterName, namespace, kubeconfigSuffix string) (client.Client, error) {
+	kubeconfigBytes, secretName, err := resolveKubeconfigSecretData(ctx, secretReader, clusterName, namespace, kubeconfigSuffix)
+	if err != nil {
+		return nil, err
 	}
-	kubeconfigBytes, ok := secret.Data["value"]
-	if !ok {
-		return nil, fmt.Errorf("kubeconfig secret %s/%s missing 'value' key", namespace, secretName)
-	}
+	log.FromContext(ctx).V(1).Info("resolved workload kubeconfig Secret", "cluster", clusterName, "secret", secretName)
 	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfigBytes)
 	if err != nil {
 		return nil, fmt.Errorf("building rest.Config from kubeconfig for cluster %s: %w", clusterName, err)

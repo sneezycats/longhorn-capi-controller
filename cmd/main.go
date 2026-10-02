@@ -49,6 +49,9 @@ func main() {
 		"Maximum time to wait for Longhorn eviction before releasing the hook. Must exceed the largest volume rebuild time.")
 	flag.DurationVar(&pollInterval, "poll-interval", envDuration("POLL_INTERVAL", 15*time.Second),
 		"How frequently to re-check Longhorn node status during eviction.")
+	var kubeconfigSuffix string
+	flag.StringVar(&kubeconfigSuffix, "workload-kubeconfig-suffix", envString("WORKLOAD_KUBECONFIG_SUFFIX", "lhcc"),
+		"Suffix for the dedicated per-cluster least-privilege kubeconfig Secret (<cluster>-<suffix>-kubeconfig); the shared <cluster>-kubeconfig Secret is the fallback. Empty disables the dedicated lookup.")
 	flag.StringVar(&longhornNamespace, "longhorn-namespace", envString("LONGHORN_NAMESPACE", "longhorn-system"),
 		"Namespace where Longhorn is deployed in workload clusters.")
 	flag.DurationVar(&gcInterval, "gc-interval", envDuration("GC_INTERVAL", 5*time.Minute),
@@ -83,27 +86,29 @@ func main() {
 	}
 
 	if err := (&controller.LonghornEvictionReconciler{
-		Client:          mgr.GetClient(),
-		APIReader:       mgr.GetAPIReader(),
-		Scheme:          mgr.GetScheme(),
-		Recorder:        mgr.GetEventRecorderFor("longhorn-capi-eviction-controller"),
-		EvictionTimeout: evictionTimeout,
-		PollInterval:    pollInterval,
-		LonghornNS:      longhornNamespace,
-		EarlyRelease:    earlyRelease,
-		EvictStuckPods:  evictStuckPods,
+		Client:                 mgr.GetClient(),
+		APIReader:              mgr.GetAPIReader(),
+		Scheme:                 mgr.GetScheme(),
+		Recorder:               mgr.GetEventRecorderFor("longhorn-capi-eviction-controller"),
+		EvictionTimeout:        evictionTimeout,
+		PollInterval:           pollInterval,
+		LonghornNS:             longhornNamespace,
+		KubeconfigSecretSuffix: kubeconfigSuffix,
+		EarlyRelease:           earlyRelease,
+		EvictStuckPods:         evictStuckPods,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "Machine")
 		os.Exit(1)
 	}
 
 	if err := (&controller.LonghornNodeGCReconciler{
-		Client:     mgr.GetClient(),
-		APIReader:  mgr.GetAPIReader(),
-		Scheme:     mgr.GetScheme(),
-		Recorder:   mgr.GetEventRecorderFor("longhorn-capi-eviction-controller"),
-		GCInterval: gcInterval,
-		LonghornNS: longhornNamespace,
+		Client:                 mgr.GetClient(),
+		APIReader:              mgr.GetAPIReader(),
+		Scheme:                 mgr.GetScheme(),
+		Recorder:               mgr.GetEventRecorderFor("longhorn-capi-eviction-controller"),
+		GCInterval:             gcInterval,
+		LonghornNS:             longhornNamespace,
+		KubeconfigSecretSuffix: kubeconfigSuffix,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Unable to create controller", "controller", "LonghornNodeGC")
 		os.Exit(1)

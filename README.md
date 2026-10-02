@@ -162,6 +162,7 @@ per-cluster.
 | `--eviction-timeout` | `EVICTION_TIMEOUT` | `2h` | Backstop: release the hook after this long regardless of state. **Must exceed your largest single-volume rebuild time** — the Longhorn KB recommends ≥4h for ~500 GB volumes on on-prem hardware. With early release active, this is rarely hit. |
 | `--poll-interval` | `POLL_INTERVAL` | `15s` | Reconcile cadence while a hook is held. |
 | `--longhorn-namespace` | `LONGHORN_NAMESPACE` | `longhorn-system` | Where Longhorn lives in workload clusters. |
+| `--workload-kubeconfig-suffix` | `WORKLOAD_KUBECONFIG_SUFFIX` | `lhcc` | Dedicated least-privilege kubeconfig Secret per cluster (`<cluster>-<suffix>-kubeconfig`), with the shared `<cluster>-kubeconfig` as fallback. Empty disables the dedicated lookup. See `config/rbac/workload_role.yaml`. |
 | `--gc-interval` | `GC_INTERVAL` | `5m` | Sweep cadence for orphaned `nodes.longhorn.io` CRs. |
 | `--early-release` | `EARLY_RELEASE` | `true` | Release the hook before rebuild completes when every affected volume is degraded-but-safe (≥ want−1 live replicas, none faulted). See [Early release](#early-release-safety) below. |
 | `--evict-stuck-pods` | `EVICT_STUCK_PODS` | `true` | After hook release: cordon the departing node and delete non-DaemonSet pods holding non-faulted Longhorn PVCs, to clear CAPI's volume-detach stage. |

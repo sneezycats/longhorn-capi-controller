@@ -116,10 +116,27 @@ cluster state.
   admin kubeconfig; controller running v0.10.0 unchanged
 - Net rancher restarts: 3 pods bounced once; no persistent damage
 
+## Implementation (later the same day)
+
+The dedicated-secret change landed:
+
+- `internal/controller/kubeconfig.go` - `kubeconfigSecretNames` /
+  `resolveKubeconfigSecretData`: the controller prefers
+  `<cluster>-<suffix>-kubeconfig` (dedicated least-priv Secret) and falls back
+  to the shared `<cluster>-kubeconfig` on NotFound. Suffix comes from
+  `--workload-kubeconfig-suffix` / `WORKLOAD_KUBECONFIG_SUFFIX` (default
+  `lhcc`; empty disables the dedicated lookup - backwards compatible). Wired
+  into both the eviction and snode-GC reconcilers; the uncached-read property
+  is unchanged.
+- `config/rbac/workload_role.yaml` - now the complete applyable identity
+  bundle (ServiceAccount + never-expiring token Secret + ClusterRole +
+  binding to the SA), with the management-side dedicated Secret recipe as a
+  commented appendix.
+
 ## Open items
 
-1. Controller change: dedicated workload kubeconfig Secret (naming convention + docs).
-2. Upstream report: rancher 2.14.3 `kubeConfigValid` nil dereference on non-`cluster`-named
+1. Upstream report: rancher 2.14.3 `kubeConfigValid` nil dereference on non-`cluster`-named
    kubeconfig entries.
-3. Re-run a cycle with the controller actually consuming the least-priv credential once the
-   dedicated secret lands (the verb surface is already proven; this validates the plumbing).
+2. Create the dedicated `<cluster>-lhcc-kubeconfig` Secret per workload cluster (fleet
+   template candidate) and re-run a cycle with the controller actually consuming the
+   least-priv credential - the verb surface is already proven; this validates the plumbing.

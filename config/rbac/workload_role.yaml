@@ -1,12 +1,62 @@
-# ClusterRole to apply inside EACH workload cluster where Longhorn is installed.
-# The controller authenticates to workload clusters via the per-cluster kubeconfig
-# Secret (<cluster>-kubeconfig); bind whatever identity that kubeconfig carries
-# to this role (see the subjects below).
+# Longhorn CAPI controller — WORKLOAD CLUSTER IDENTITY BUNDLE (least privilege)
 #
-# Apply with:
-#   kubectl --kubeconfig <workload-kubeconfig> apply -f workload_role.yaml
+# Apply INSIDE EACH workload cluster the controller serves:
 #
-# Or via Fleet/ArgoCD bundle targeting workload clusters.
+#   kubectl --kubeconfig <workload-admin-kubeconfig> apply -f workload_role.yaml
+#
+# One apply creates everything the controller's least-privilege credential
+# needs: the ServiceAccount, its never-expiring token, the minimal
+# ClusterRole, and the binding between them. The resulting credential is then
+# handed to the controller on the MANAGEMENT cluster as a dedicated Secret
+# named <cluster>-lhcc-kubeconfig (example at the bottom of this file).
+#
+# Do NOT put a least-privilege credential into the shared <cluster>-kubeconfig
+# Secret: that Secret is Rancher's own managed credential (the drainer and
+# Rancher's kubeconfig manager both consume it, and Rancher regenerates it —
+# mutating it breaks Rancher; see
+# docs/least-priv-workload-credential-2026-10-02.md).
+#
+# For clusters WITHOUT Longhorn (GKE PD CSI, AKS, Portworx, ...) the
+# nodes.longhorn.io GET fails as NotFound and the controller no-ops — the
+# same bundle works there unchanged; the Longhorn-scoped grants are simply
+# unused (verified: control-plane machines carry no Longhorn Node CR).
+#
+# NOTE the nodes/finalizers rule: wrangler's metadata-only finalizer patch
+# goes through the main-resource endpoint, but we keep the typed rule so an
+# Update-based implementation cannot silently break.
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: lhcc-eviction-agent
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+    app.kubernetes.io/component: workload-rbac
+---
+# Never-expiring ServiceAccount token. Manual secret: k8s >= 1.24 stopped
+# auto-generating SA tokens. Read the token with:
+#
+#   kubectl -n kube-system get secret lhcc-eviction-agent-token \
+#     -o jsonpath='{.data.token}' | base64 -d
+#
+# Rotate by deleting this Secret, re-applying it, and rebuilding the
+# kubeconfig Secret on the management cluster.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lhcc-eviction-agent-token
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: longhorn-capi-controller
+    app.kubernetes.io/component: workload-rbac
+  annotations:
+    kubernetes.io/service-account.name: lhcc-eviction-agent
+type: kubernetes.io/service-account-token
+---
+# Everything the controller reads or mutates on a workload cluster, and
+# nothing more (verified against the call sites in internal/controller/ and
+# by a full machine-deletion cycle under this exact role — zero forbidden).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -15,6 +65,8 @@ metadata:
     app.kubernetes.io/name: longhorn-capi-controller
     app.kubernetes.io/component: workload-rbac
 rules:
+  # nodes: cordon (patch), eviction request (patch), health & placement reads,
+  # and snode GC cleanup (delete + finalizer work).
   - apiGroups: ["longhorn.io"]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch", "delete"]
@@ -24,32 +76,29 @@ rules:
   - apiGroups: ["longhorn.io"]
     resources: ["nodes/status"]
     verbs: ["get"]
-  # Rebuild-completion gate: list replicas + volumes to verify rebuild; DELETE a
-  # replica that sits on a CAPI-deleting node to force a rebuild onto a healthy node.
+  # replicas: locate and delete departing-node replicas to force rebuilds.
   - apiGroups: ["longhorn.io"]
     resources: ["replicas"]
     verbs: ["get", "list", "watch", "delete"]
-  # CRIT-1b relocation: temporarily RAISE a volume's spec.numberOfReplicas when
-  # its only data-holding replicas sit on a node CAPI is deleting, so Longhorn
-  # schedules the replacement immediately; the original count is restored on
-  # hook release (restoreReplicaWants).
+  # volumes: read exposure state; CRIT-1b relocation patches
+  # spec.numberOfReplicas (raise for immediate rebuild, restore on release).
   - apiGroups: ["longhorn.io"]
     resources: ["volumes"]
     verbs: ["get", "list", "watch", "patch"]
-  # EvictStuckPods (post-release attachment cleanup): cordon the departing node
-  # and force-delete workload pods holding Longhorn PVCs. Requires Pod list/
-  # delete (cluster-wide: pods land in every namespace), PVC lookup (to map a
-  # pod's claim to its Longhorn volume), and core Node patch (cordon).
+  # pods: EvictStuckPods lists cluster-wide by spec.nodeName and force-deletes
+  # non-DaemonSet pods holding PVCs on the departing node.
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "delete"]
+  # PVCs: map pods to volumes via claimRef.
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list"]
+  # core nodes: cordon the departing node (spec.unschedulable) and health
+  # reads.
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
-
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -63,14 +112,40 @@ roleRef:
   kind: ClusterRole
   name: longhorn-capi-eviction-workload
 subjects:
-  # Bind the identity that appears INSIDE the workload cluster kubeconfig
-  # Secret (<cluster>-kubeconfig) — the credential this controller uses to
-  # talk to that cluster. Rancher-provisioned clusters use a Rancher-issued
-  # user (u-…); the CAPI default kubeconfig uses the bootstrap admin or a
-  # dedicated ServiceAccount. Replace before applying.
-  - kind: User
-    name: REPLACE_WITH_KUBECONFIG_IDENTITY
-
-# NOTE: there is deliberately no namespaced (Role) variant of this file:
-# EvictStuckPods lists and deletes pods across every namespace and cordons
-# cluster-scoped Nodes, which cannot be expressed as a single namespaced Role.
+  - kind: ServiceAccount
+    name: lhcc-eviction-agent
+    namespace: kube-system
+# -----------------------------------------------------------------------------
+# MANAGEMENT cluster side — hand the credential to the controller. Build a
+# kubeconfig from the token above and store it as a dedicated Secret in the
+# cluster's provisioning namespace (fleet-default for Rancher-provisioned
+# clusters). Key must be "value"; the controller falls back to the shared
+# <cluster>-kubeconfig Secret when this one is absent.
+#
+#   TOKEN=$(kubectl --kubeconfig <workload-admin-kubeconfig> -n kube-system \
+#     get secret lhcc-eviction-agent-token -o jsonpath='{.data.token}' | base64 -d)
+#   CA=$(kubectl --kubeconfig <workload-admin-kubeconfig> -n default \
+#     get cm kube-root-ca.crt -o jsonpath='{.data.ca\.crt}' | base64 -w0)
+#   kubectl -n fleet-default create secret generic <cluster-id>-lhcc-kubeconfig \
+#     --from-literal=value="$(cat <<KC
+#   apiVersion: v1
+#   kind: Config
+#   clusters:
+#   - name: cluster
+#     cluster:
+#       server: https://<workload-apiserver>:6443
+#       certificate-authority-data: $CA
+#   contexts:
+#   - name: cluster
+#     context: {cluster: cluster, user: lhcc-eviction-agent}
+#   current-context: cluster
+#   users:
+#   - name: lhcc-eviction-agent
+#     user: {token: $TOKEN}
+#   KC
+#   )"
+#
+# server must be reachable FROM THE CONTROLLER POD on the management cluster.
+# A control-plane node IP works but changes when that VM is replaced — prefer
+# a stable endpoint (LB/DNS) where available. The kubeconfig's internal entry
+# names are irrelevant to the controller; "cluster" matches CAPI convention.

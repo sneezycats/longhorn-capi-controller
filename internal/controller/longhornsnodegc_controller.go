@@ -53,6 +53,8 @@ type LonghornNodeGCReconciler struct {
 	Recorder   record.EventRecorder
 	GCInterval time.Duration
 	LonghornNS string
+	// KubeconfigSecretSuffix: see LonghornEvictionReconciler.
+	KubeconfigSecretSuffix string
 	// workloadClients caches per-workload-cluster clients, keyed
 	// "namespace/clusterName". Guarded by mu: accessed from both the Cluster
 	// reconcile path and the periodic ticker goroutine.
@@ -132,7 +134,7 @@ func (r *LonghornNodeGCReconciler) workloadClient(ctx context.Context, key, clus
 	if c, ok := r.workloadClients[key]; ok {
 		return c, nil
 	}
-	c, err := buildWorkloadClusterClient(ctx, r.APIReader, clusterName, namespace)
+	c, err := buildWorkloadClusterClient(ctx, r.APIReader, clusterName, namespace, r.KubeconfigSecretSuffix)
 	if err != nil {
 		return nil, err
 	}
