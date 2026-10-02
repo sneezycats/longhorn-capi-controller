@@ -13,8 +13,7 @@
 # Do NOT put a least-privilege credential into the shared <cluster>-kubeconfig
 # Secret: that Secret is Rancher's own managed credential (the drainer and
 # Rancher's kubeconfig manager both consume it, and Rancher regenerates it —
-# mutating it breaks Rancher; see
-# docs/least-priv-workload-credential-2026-10-02.md).
+# mutating it breaks Rancher — leave it Rancher-managed).
 #
 # For clusters WITHOUT Longhorn (GKE PD CSI, AKS, Portworx, ...) the
 # nodes.longhorn.io GET fails as NotFound and the controller no-ops — the
