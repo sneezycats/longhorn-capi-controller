@@ -12,4 +12,4 @@ labels:
     includeSelectors: false
 images:
   - name: ghcr.io/sneezycats/longhorn-capi-controller
-    newTag: 0.9-alpha
+    newTag: 0.10.0
