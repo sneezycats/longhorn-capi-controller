@@ -137,6 +137,16 @@ The dedicated-secret change landed:
 
 1. Upstream report: rancher 2.14.3 `kubeConfigValid` nil dereference on non-`cluster`-named
    kubeconfig entries.
-2. Create the dedicated `<cluster>-lhcc-kubeconfig` Secret per workload cluster (fleet
-   template candidate) and re-run a cycle with the controller actually consuming the
-   least-priv credential - the verb surface is already proven; this validates the plumbing.
+2. Plumbing VALIDATED (v0.11.0, same day): dedicated Secret
+   `fleet-default/lhcc-roll2-lhcc-kubeconfig` created (SA kubeconfig, direct
+   apiserver endpoint, CA from kube-root-ca.crt); controller 0.11.0 deployed;
+   positive resolution proof captured via `--zap-log-level=debug`
+   ("resolved workload kubeconfig Secret ... secret=lhcc-roll2-lhcc-kubeconfig",
+   snode-GC pass); then a full cycle on worker psjmw (17:07:41Z) with the
+   controller consuming the least-priv credential: zero forbidden, hook
+   register + early release in seconds (no sole-replica exposure), drain,
+   VM teardown, replacement vkskx Ready ~3 min join, all 4 volumes healthy,
+   writers 0 restarts with counters continuing through the cycle.
+   Endpoint caveat: the Secret's server URL is a control-plane node IP
+   (https://192.168.1.149:6443) reachable from the controller pod; it changes
+   if that VM is replaced - prefer a stable LB/DNS endpoint in production.
