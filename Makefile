@@ -4,7 +4,7 @@
 BINARY ?= bin/manager
 IMAGE  ?= ghcr.io/sneezycats/longhorn-capi-controller:dev
 
-.PHONY: all build test fmt vet vuln docker-build clean
+.PHONY: all build test fmt vet vuln docker-build docker-check gate clean
 
 all: build
 
@@ -26,6 +26,14 @@ vuln:
 
 docker-build:
 	docker build -t $(IMAGE) .
+
+docker-check:
+	docker build --target=check .
+
+# Full deterministic gate (in-container tests + govulncheck on the binary);
+# PUBLISH=1 IMAGE=... make gate  pushes and re-verifies from the registry.
+gate:
+	IMAGE=$(IMAGE) PUBLISH=$(PUBLISH) bash scripts/check.sh
 
 clean:
 	rm -rf bin

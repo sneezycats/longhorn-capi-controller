@@ -1,10 +1,19 @@
 # syntax=docker/dockerfile:1
 # Multi-stage build for longhorn-capi-controller.
 # Produces a minimal distroless image containing only the static binary.
+#
+# Stages:
+#   base    — pinned Go toolchain; dependencies fetched into a cached layer
+#   check   — deterministic gates: go.sum vs go.mod integrity + unit tests.
+#             Run standalone with `docker build --target=check .`
+#             (no host Go toolchain required — the gate runs in-container).
+#   builder — cross-compiles the static /manager binary
+#   final   — distroless runtime image (default target)
+#
 # Base images are digest-pinned (multi-arch indexes) so builds are
 # reproducible and auditable — bump tag and digest together.
 
-FROM golang:1.27@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS builder
+FROM golang:1.27@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190 AS base
 WORKDIR /src
 
 # Cache deps first.
@@ -12,7 +21,14 @@ COPY go.mod go.sum ./
 COPY third_party/ third_party/
 RUN go mod download
 
-# Copy source.
+FROM base AS check
+# Gate stage: go.sum must match go.mod (deterministic resolution), then all
+# unit tests must pass. Fails the build otherwise.
+COPY cmd/ cmd/
+COPY internal/ internal/
+RUN go mod verify && go test ./...
+
+FROM base AS builder
 COPY cmd/ cmd/
 COPY internal/ internal/
 
