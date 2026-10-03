@@ -36,7 +36,7 @@ bash scripts/check.sh
 # or: make gate
 
 # gates + publish + registry re-verify (explicit opt-in only):
-PUBLISH=1 IMAGE=ghcr.io/sneezycats/longhorn-capi-controller:0.11.0a bash scripts/check.sh
+PUBLISH=1 IMAGE=ghcr.io/sneezycats/longhorn-capi-controller:0.11.1 bash scripts/check.sh
 ```
 
 Publish deletes the local image, pulls the **registry** copy back, and
